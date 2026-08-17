@@ -1,5 +1,5 @@
 # Axis — variable font editor
-
+<img width="1623" height="1302" alt="screencapture-delarryguilherme-ctrl-github-io-Typographust-2026-08-17-17_07_19" src="https://github.com/user-attachments/assets/74724092-0284-42be-b38d-8eef377f1c42" />
 Upload a static TrueType font, define variation axes, preview them live, and export a single
 variable `.ttf`.
 
