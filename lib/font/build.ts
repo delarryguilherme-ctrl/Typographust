@@ -353,6 +353,9 @@ export function buildStaticFonts(source: SourceFont, options: BuildOptions): Sta
   const { base, masters, plan } = designSpace(source, options);
   const family = options.familyName.trim() || source.familyName;
   const psFamily = postScriptSafe(family.replace(/\s+/g, ""));
+  // Two instances can sanitise to the same PostScript name; a ZIP holding two
+  // files of one name loses one of them on extraction.
+  const usedNames = new Set<string>();
 
   return instances.map((instance) => {
     const coords = axes.map((a) => clampAxis(a, instance.coords[a.tag] ?? a.def));
@@ -393,7 +396,11 @@ export function buildStaticFonts(source: SourceFont, options: BuildOptions): Sta
         ? "Italic"
         : "Regular";
 
-    const psStyle = postScriptSafe(style.replace(/\s+/g, ""));
+    let psStyle = postScriptSafe(style.replace(/\s+/g, ""));
+    for (let n = 2; usedNames.has(psStyle.toLowerCase()); n++) {
+      psStyle = `${postScriptSafe(style.replace(/\s+/g, ""))}${n}`;
+    }
+    usedNames.add(psStyle.toLowerCase());
     const names = new NameBuilder();
     names.set(1, legacyFamily);
     names.set(2, legacyStyle);
@@ -530,7 +537,7 @@ function rebuildOutlineTables(tables: TableMap, source: SourceFont, base: Glyph[
 function addGlyphTables(tables: TableMap, source: SourceFont, plan: FigurePlan | null, warnings: string[]) {
   if (!plan) return;
   const count = source.glyphs.length;
-  const added = plan.digits.length;
+  const added = plan.sources.length;
 
   try {
     tables.set("GSUB", addSubstitutions(tables.get("GSUB"), plan.features));
@@ -571,8 +578,8 @@ function addGlyphTables(tables: TableMap, source: SourceFont, plan: FigurePlan |
       heights.push(last);
     }
     for (let i = 0; i < added; i++) {
-      heights.push(heights[plan.digits[i]] ?? last);
-      tsbs.push(tsbs[plan.digits[i]] ?? 0);
+      heights.push(heights[plan.sources[i]] ?? last);
+      tsbs.push(tsbs[plan.sources[i]] ?? 0);
     }
     const w = new Writer(heights.length * 4);
     heights.forEach((h, i) => {

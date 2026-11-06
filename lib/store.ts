@@ -356,9 +356,16 @@ export const useApp = create<AppState>((set, get) => ({
     const { source, axes, coords } = get();
     if (!source) return;
     if (axes.some((a) => a.tag === tag)) return;
-    const axis = makeAxis(tag, source.shape);
+    // Re-adding the weight or italic axis of a family brings its drawn masters
+    // back, rather than a synthetic-only axis that silently ignores them.
+    const family =
+      (tag === "wght" || tag === "ital") && source.drawn.length > 0
+        ? makeFamilyAxes(source.shape, source.drawn, source.italic)
+        : null;
+    const axis = family?.axes.find((a) => a.tag === tag) ?? makeAxis(tag, source.shape);
     const next = [...axes, axis];
     set({
+      ...(family ? { corners: family.corners } : {}),
       axes: next,
       selectedAxisId: axis.id,
       coords: clampCoords(next, coords),
@@ -380,8 +387,26 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   updateAxis(id, patch) {
+    const before = get().axes.find((a) => a.id === id);
     const next = get().axes.map((a) => (a.id === id ? { ...a, ...patch } : a));
-    set({ axes: next, coords: clampCoords(next, get().coords), issues: validateAxes(next) });
+    // Corner masters and instances address axes by tag; follow a rename.
+    const renamed = before && patch.tag !== undefined && patch.tag !== before.tag ? [before.tag, patch.tag] : null;
+    const retag = (coords: Record<string, number>) => {
+      if (!renamed || !(renamed[0] in coords)) return coords;
+      const { [renamed[0]]: value, ...rest } = coords;
+      return { ...rest, [renamed[1]]: value };
+    };
+    set({
+      axes: next,
+      coords: clampCoords(next, retag(get().coords)),
+      issues: validateAxes(next),
+      ...(renamed
+        ? {
+            corners: get().corners.map((c) => ({ ...c, coords: retag(c.coords) })),
+            instances: get().instances.map((i) => ({ ...i, coords: retag(i.coords) })),
+          }
+        : {}),
+    });
     get().rebuild();
   },
 
@@ -438,9 +463,19 @@ export const useApp = create<AppState>((set, get) => ({
 
   addInstance() {
     const { axes, instances, coords } = get();
+    // The first free number, so deleting one and capturing again cannot
+    // produce two instances (and two static files) with the same name.
+    const taken = new Set(instances.map((i) => i.name.trim()));
+    let n = instances.length + 1;
+    for (let k = 1; k <= instances.length + 1; k++) {
+      if (!taken.has(`Instance ${k}`)) {
+        n = k;
+        break;
+      }
+    }
     const inst: NamedInstance = {
       id: newId("inst"),
-      name: `Instance ${instances.length + 1}`,
+      name: `Instance ${n}`,
       coords: Object.fromEntries(axes.map((a) => [a.tag, coords[a.tag] ?? a.def])),
     };
     set({ instances: [...instances, inst] });

@@ -4,6 +4,7 @@ import type { SourceFace } from "./face";
 import { faceLabel } from "./face";
 import type { FontMetrics, Glyph } from "./glyf";
 import { buildPostWithNames } from "./post";
+import { inferWeight } from "./stem";
 import type { TableMap } from "./sfnt";
 
 /**
@@ -89,7 +90,13 @@ export function assembleFamily(faces: SourceFace[], choice: FamilyChoice = {}): 
   const notes: string[] = [];
 
   // --- who belongs ---------------------------------------------------------
-  const anchor = faces.find((f) => f.id === choice.defaultId) ?? faces[0];
+  // Without an explicit choice, the family with the most files wins — not
+  // whichever file happened to come first in the drop.
+  const counts = new Map<string, number>();
+  for (const f of faces) counts.set(f.familyName, (counts.get(f.familyName) ?? 0) + 1);
+  const anchor =
+    faces.find((f) => f.id === choice.defaultId) ??
+    faces.reduce((best, f) => ((counts.get(f.familyName) ?? 0) > (counts.get(best.familyName) ?? 0) ? f : best));
   const reasons = new Map<string, string>();
   for (const f of faces) {
     if (f.id === anchor.id) continue;
@@ -238,7 +245,11 @@ function placeWeights(faces: SourceFace[], notes: string[]): Map<string, number>
   if (!declaredOk && faces.length > 1) {
     notes.push("The declared weights clash with how heavy the drawings measure, so measured weights place the masters.");
   }
-  for (const f of faces) placement.set(f.id, declaredOk || faces.length === 1 ? f.declaredWeight : f.measuredWeight);
+  // Unrounded, so two different weights cannot collapse onto one value and be
+  // mistaken for the same style.
+  for (const f of faces) {
+    placement.set(f.id, declaredOk || faces.length === 1 ? f.declaredWeight : inferWeight(f.stem, f.upem, 1));
+  }
   return placement;
 }
 
@@ -326,6 +337,11 @@ function assembleGlyph(
   }
 
   const members = otherContours.map((c, k) => (c ? k : -1)).filter((k) => k >= 0);
+  // Nothing matched: keep the default's own points instead of re-emitting it
+  // with every implied point made explicit.
+  if (members.length === 0) {
+    return { base: defCubic ? quadratize(def, tolerance) : def, aligned: others.map(() => null) };
+  }
   const sets = harmonize([baseContours, ...members.map((k) => otherContours[k]!)]);
   const emitted = emitTogether(sets, tolerance);
 

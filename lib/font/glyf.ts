@@ -23,6 +23,8 @@ const MORE_COMPONENTS = 0x0020;
 const WE_HAVE_AN_X_AND_Y_SCALE = 0x0040;
 const WE_HAVE_A_TWO_BY_TWO = 0x0080;
 const WE_HAVE_INSTRUCTIONS = 0x0100;
+const SCALED_COMPONENT_OFFSET = 0x0800;
+const UNSCALED_COMPONENT_OFFSET = 0x1000;
 
 const ON_CURVE = 0x01;
 const X_SHORT = 0x02;
@@ -216,22 +218,17 @@ function readCompositeGlyph(
     flags = r.u16();
     const glyphIndex = r.u16();
 
-    let dx = 0;
-    let dy = 0;
+    // Either an x/y offset, or two point numbers: a point already placed in
+    // this composite, and the point of the component that must land on it.
+    const xy = (flags & ARGS_ARE_XY_VALUES) !== 0;
+    let arg1: number;
+    let arg2: number;
     if (flags & ARG_1_AND_2_ARE_WORDS) {
-      const a1 = r.i16();
-      const a2 = r.i16();
-      if (flags & ARGS_ARE_XY_VALUES) {
-        dx = a1;
-        dy = a2;
-      }
+      arg1 = xy ? r.i16() : r.u16();
+      arg2 = xy ? r.i16() : r.u16();
     } else {
-      const a1 = r.i8();
-      const a2 = r.i8();
-      if (flags & ARGS_ARE_XY_VALUES) {
-        dx = a1;
-        dy = a2;
-      }
+      arg1 = xy ? r.i8() : r.u8();
+      arg2 = xy ? r.i8() : r.u8();
     }
 
     let a = 1;
@@ -251,10 +248,29 @@ function readCompositeGlyph(
     }
 
     const sub = readOutline(glyphIndex, depth + 1);
-    const base = points.length;
-    for (const p of sub.points) {
-      points.push({ x: a * p.x + c * p.y + dx, y: b * p.x + d * p.y + dy, on: p.on });
+    const transformed = sub.points.map((p) => ({ x: a * p.x + c * p.y, y: b * p.x + d * p.y, on: p.on }));
+
+    let dx = 0;
+    let dy = 0;
+    if (xy) {
+      dx = arg1;
+      dy = arg2;
+      // Apple's convention: the offset is itself transformed.
+      if (flags & SCALED_COMPONENT_OFFSET && !(flags & UNSCALED_COMPONENT_OFFSET)) {
+        dx = a * arg1 + c * arg2;
+        dy = b * arg1 + d * arg2;
+      }
+    } else {
+      const anchor = points[arg1];
+      const own = transformed[arg2];
+      if (anchor && own) {
+        dx = anchor.x - own.x;
+        dy = anchor.y - own.y;
+      }
     }
+
+    const base = points.length;
+    for (const p of transformed) points.push({ x: p.x + dx, y: p.y + dy, on: p.on });
     for (const e of sub.endPts) endPts.push(base + e);
   }
 

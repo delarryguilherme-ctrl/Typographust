@@ -381,3 +381,62 @@ export function addSubstitutions(gsub: Uint8Array | undefined, add: Substitution
   }
   return w.toBytes();
 }
+
+function readCoverage(table: Uint8Array, at: number): number[] {
+  const r = new Reader(table, at);
+  const format = r.u16();
+  const out: number[] = [];
+  if (format === 1) {
+    const count = r.u16();
+    for (let i = 0; i < count; i++) out.push(r.u16());
+  } else if (format === 2) {
+    const count = r.u16();
+    for (let i = 0; i < count; i++) {
+      const start = r.u16();
+      const end = r.u16();
+      r.u16(); // startCoverageIndex
+      for (let g = start; g <= end; g++) out.push(g);
+    }
+  }
+  return out;
+}
+
+/**
+ * Glyphs that single-substitution features turn `from` into — the slashed
+ * zero of `zero`, the oldstyle figures of `onum`, a stylistic set's digits.
+ * They are figures too, so they need tabular and proportional versions, or a
+ * column that uses them stops lining up.
+ */
+export function substitutesOf(gsub: Uint8Array | undefined, from: Set<number>, tags: (tag: string) => boolean): number[] {
+  if (!gsub || gsub.length < 10) return [];
+  try {
+    const parsed = parse(gsub);
+    const lookups = new Set<number>();
+    for (const f of parsed.features) if (tags(f.tag)) for (const l of f.lookups) lookups.add(l);
+    const out = new Set<number>();
+    for (const index of lookups) {
+      const lookup = parsed.lookups[index];
+      if (!lookup || lookup.type !== 1) continue;
+      for (const at of lookup.subtables) {
+        const r = new Reader(gsub, at);
+        const format = r.u16();
+        const coverage = readCoverage(gsub, at + r.u16());
+        if (format === 1) {
+          const delta = r.i16();
+          for (const g of coverage) if (from.has(g)) out.add((g + delta) & 0xffff);
+        } else if (format === 2) {
+          const count = r.u16();
+          const subs: number[] = [];
+          for (let i = 0; i < count; i++) subs.push(r.u16());
+          coverage.forEach((g, i) => {
+            if (from.has(g) && subs[i] !== undefined) out.add(subs[i]);
+          });
+        }
+      }
+    }
+    for (const g of from) out.delete(g);
+    return [...out].sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
+}

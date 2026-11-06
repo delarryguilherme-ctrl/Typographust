@@ -88,8 +88,8 @@ export function stemAt(weight: number, sourceWeight: number, sourceStem: number)
  * The weight class the drawing suggests, which is not always the one the font
  * declares — `usWeightClass` is wrong often enough to be worth checking.
  */
-export function inferWeight(stem: number, upem: number) {
+export function inferWeight(stem: number, upem: number, step = 25) {
   const reference = REGULAR_STEM_RATIO * upem;
   const weight = 400 + (100 * Math.log(stem / reference)) / Math.log(WEIGHT_RATIO);
-  return Math.max(100, Math.min(900, Math.round(weight / 25) * 25));
+  return Math.max(100, Math.min(900, Math.round(weight / step) * step));
 }
