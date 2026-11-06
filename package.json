@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "worker": "esbuild lib/build.worker.ts --bundle --format=iife --minify --external:brotli/decompress --outfile=public/build-worker.js --log-level=warning",
+    "predev": "npm run worker",
     "dev": "next dev",
+    "prebuild": "npm run worker",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
@@ -21,6 +24,7 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "esbuild": "^0.25.12",
     "eslint": "^9",
     "eslint-config-next": "16.3.0",
     "tailwindcss": "^4",

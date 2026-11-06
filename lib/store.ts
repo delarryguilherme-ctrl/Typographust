@@ -1,8 +1,8 @@
 "use client";
 
 import { create } from "zustand";
-import { buildStaticFonts, buildVariableFont, loadFaces, type SourceFont } from "./font/build";
-import { buildZip } from "./font/zip";
+import { loadFaces, type SourceFont } from "./font/build";
+import { buildInWorker, cancelBuild, exportStaticsInWorker, isSuperseded } from "./buildClient";
 import {
   defaultInstances,
   deformationAt,
@@ -113,6 +113,8 @@ const SAMPLE = "Handgloves\nVariable typography 0123";
 let previewFace: FontFace | null = null;
 let buildTimer: ReturnType<typeof setTimeout> | null = null;
 let familyCounter = 0;
+/** Bumped by every rebuild and reset; a result is only applied if it is still the latest. */
+let buildTicket = 0;
 
 function clampCoords(axes: AxisDef[], coords: Record<string, number>) {
   const next: Record<string, number> = {};
@@ -123,47 +125,93 @@ function clampCoords(axes: AxisDef[], coords: Record<string, number>) {
   return next;
 }
 
+/** What the weight and italic axes are built from: the default and its drawn masters. */
+function drawnSignature(source: SourceFont) {
+  const def = source.roles.find((r) => r.role === "default");
+  const drawn = source.drawn.map((d) => `${d.id}:${d.weight}:${d.italic}`).sort();
+  return [def?.id, source.italic, ...drawn].join("|");
+}
+
+interface Previous {
+  axes: AxisDef[];
+  corners: CornerMaster[];
+  instances: NamedInstance[];
+  coords: Record<string, number>;
+  selectedAxisId: string | null;
+  familyName: string;
+  figures: FigureOptions;
+  source: SourceFont | null;
+}
+
 /**
- * Re-assembles the family after the set of faces or their roles changed. The
- * weight and italic axes follow the drawn masters; every other axis the user
- * set up is kept.
+ * Re-assembles the family after the set of faces or their roles changed.
+ *
+ * The user's work survives whenever it still applies: if the default and its
+ * drawn masters are unchanged (a face from another family was added, say), the
+ * axes stay exactly as edited; other axes are always kept; instances are kept
+ * as long as the set of axis tags is the same. Only when the drawn masters
+ * themselves change are the weight and italic axes rebuilt around them.
  */
-function assemble(
-  faces: SourceFace[],
-  defaultFaceId: string | null,
-  excluded: string[],
-  previous: { axes: AxisDef[]; familyName: string; source: SourceFont | null },
-) {
+function assemble(faces: SourceFace[], defaultFaceId: string | null, excluded: string[], previous: Previous) {
   const source = assembleFamily(faces, { defaultId: defaultFaceId, excluded: new Set(excluded) });
 
-  let familyAxes: AxisDef[];
-  let corners: CornerMaster[] = [];
-  if (source.drawn.length > 0) {
-    ({ axes: familyAxes, corners } = makeFamilyAxes(source.shape, source.drawn));
+  let axes: AxisDef[];
+  let corners: CornerMaster[];
+  const unchanged = previous.source !== null && drawnSignature(previous.source) === drawnSignature(source);
+  if (unchanged) {
+    axes = previous.axes;
+    corners = previous.corners;
   } else {
-    // Seed with the axes that make sense for a single-master source: weight
-    // first, then `ital` rather than `slnt` — design tools and CSS treat
-    // `ital` as the italic switch, while `slnt` is just another slider.
-    familyAxes = [makeAxis("wght", source.shape), makeAxis("ital", source.shape)];
+    let familyAxes: AxisDef[];
+    if (source.drawn.length > 0) {
+      ({ axes: familyAxes, corners } = makeFamilyAxes(source.shape, source.drawn, source.italic));
+    } else {
+      // Seed with the axes that make sense for a single-master source: weight
+      // first, then `ital` rather than `slnt` — design tools and CSS treat
+      // `ital` as the italic switch, while `slnt` is just another slider. An
+      // italic source is already italic, so it gets no italic axis.
+      familyAxes = source.italic
+        ? [makeAxis("wght", source.shape)]
+        : [makeAxis("wght", source.shape), makeAxis("ital", source.shape)];
+      corners = [];
+    }
+    const kept = previous.axes.filter((a) => a.tag !== "wght" && a.tag !== "ital" && !a.stops.some((s) => s.faceId));
+    axes = [...familyAxes, ...kept];
   }
-  const kept = previous.axes.filter((a) => a.tag !== "wght" && a.tag !== "ital" && !a.stops.some((s) => s.faceId));
-  const axes = [...familyAxes, ...kept];
+
+  const tags = (list: AxisDef[]) =>
+    list
+      .map((a) => a.tag)
+      .sort()
+      .join(",");
+  const sameTags = previous.instances.length > 0 && tags(previous.axes) === tags(axes);
+  const instances = sameTags
+    ? previous.instances.map((i) => ({ ...i, coords: clampCoords(axes, i.coords) }))
+    : defaultInstances(axes, source.italic);
 
   // Suffixed so the export never collides with the static already installed
-  // under the same name. A name the user typed survives re-assembly.
-  const sameFamily = previous.source?.familyName === source.familyName;
+  // under the same name. A name the user typed survives re-assembly, and so
+  // do figure settings — but a tabular width in another font's units would
+  // be meaningless, so a different family starts from the defaults.
+  const sameFamily =
+    previous.source?.familyName === source.familyName &&
+    previous.source?.metrics.unitsPerEm === source.metrics.unitsPerEm;
   const familyName = sameFamily && previous.familyName ? previous.familyName : `${source.familyName} VF`;
+  const figures = sameFamily ? previous.figures : DEFAULT_FIGURES;
 
   return {
     source,
     defaultFaceId: faces.find((f) => source.roles.some((r) => r.id === f.id && r.role === "default"))?.id ?? null,
     axes,
     corners,
-    instances: defaultInstances(axes),
+    instances,
     familyName,
+    figures,
     figureInfo: analyzeFigures(source),
-    selectedAxisId: axes[0]?.id ?? null,
-    coords: clampCoords(axes, {}),
+    selectedAxisId: axes.some((a) => a.id === previous.selectedAxisId)
+      ? previous.selectedAxisId
+      : (axes[0]?.id ?? null),
+    coords: clampCoords(axes, sameTags ? previous.coords : {}),
     issues: validateAxes(axes),
   };
 }
@@ -221,10 +269,10 @@ export const useApp = create<AppState>((set, get) => ({
     }
 
     try {
-      const { faces, defaultFaceId, excludedFaceIds, axes, familyName, source } = get();
+      const { faces, defaultFaceId, excludedFaceIds } = get();
       const nextFaces = [...faces, ...added];
       set({
-        ...assemble(nextFaces, defaultFaceId, excludedFaceIds, { axes, familyName, source }),
+        ...assemble(nextFaces, defaultFaceId, excludedFaceIds, previousOf(get())),
         faces: nextFaces,
         loading: false,
         loadError,
@@ -238,8 +286,16 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   reset() {
+    if (buildTimer) clearTimeout(buildTimer);
+    buildTimer = null;
+    buildTicket += 1;
+    cancelBuild();
+    if (previewFace) document.fonts.delete(previewFace);
+    previewFace = null;
     if (get().built) URL.revokeObjectURL(get().built!.url);
     set({
+      figures: DEFAULT_FIGURES,
+      building: false,
       faces: [],
       defaultFaceId: null,
       excludedFaceIds: [],
@@ -259,22 +315,22 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   setDefaultFace(id) {
-    const { faces, excludedFaceIds, axes, familyName, source } = get();
+    const { faces, excludedFaceIds } = get();
     const excluded = excludedFaceIds.filter((x) => x !== id);
-    set({ ...assemble(faces, id, excluded, { axes, familyName, source }), excludedFaceIds: excluded });
+    set({ ...assemble(faces, id, excluded, previousOf(get())), excludedFaceIds: excluded });
     get().rebuild();
   },
 
   toggleFace(id) {
-    const { faces, defaultFaceId, excludedFaceIds, axes, familyName, source } = get();
+    const { faces, defaultFaceId, excludedFaceIds } = get();
     if (id === defaultFaceId) return;
     const excluded = excludedFaceIds.includes(id) ? excludedFaceIds.filter((x) => x !== id) : [...excludedFaceIds, id];
-    set({ ...assemble(faces, defaultFaceId, excluded, { axes, familyName, source }), excludedFaceIds: excluded });
+    set({ ...assemble(faces, defaultFaceId, excluded, previousOf(get())), excludedFaceIds: excluded });
     get().rebuild();
   },
 
   removeFace(id) {
-    const { faces, defaultFaceId, excludedFaceIds, axes, familyName, source } = get();
+    const { faces, defaultFaceId, excludedFaceIds } = get();
     const next = faces.filter((f) => f.id !== id);
     if (next.length === 0) {
       get().reset();
@@ -282,7 +338,7 @@ export const useApp = create<AppState>((set, get) => ({
     }
     const excluded = excludedFaceIds.filter((x) => x !== id);
     const nextDefault = defaultFaceId === id ? null : defaultFaceId;
-    set({ ...assemble(next, nextDefault, excluded, { axes, familyName, source }), faces: next, excludedFaceIds: excluded });
+    set({ ...assemble(next, nextDefault, excluded, previousOf(get())), faces: next, excludedFaceIds: excluded });
     get().rebuild();
   },
 
@@ -406,7 +462,7 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   regenerateInstances() {
-    set({ instances: defaultInstances(get().axes) });
+    set({ instances: defaultInstances(get().axes, get().source?.italic) });
     get().rebuild();
   },
 
@@ -429,35 +485,33 @@ export const useApp = create<AppState>((set, get) => ({
     if (!source || issues.length > 0 || instances.length === 0) return;
 
     set({ exportingStatics: true, buildError: null });
-    // Yielding first lets the button reach its pending state before the main
-    // thread is tied up flattening every instance.
-    setTimeout(() => {
-      try {
-        const statics = buildStaticFonts(source, { familyName, axes, instances, corners, figures });
-        const zip = buildZip(statics.map((s) => ({ name: s.fileName, data: s.data })));
+    exportStaticsInWorker(source, { familyName, axes, instances, corners, figures })
+      .then(({ zip }) => {
         const url = URL.createObjectURL(new Blob([zip.slice().buffer as ArrayBuffer], { type: "application/zip" }));
-
         const link = document.createElement("a");
         link.href = url;
         link.download = `${(familyName || "Font").replace(/\s+/g, "")}-static.zip`;
         link.click();
         setTimeout(() => URL.revokeObjectURL(url), 10_000);
         set({ exportingStatics: false });
-      } catch (e) {
+      })
+      .catch((e) => {
         set({ exportingStatics: false, buildError: e instanceof Error ? e.message : String(e) });
-      }
-    }, 30);
+      });
   },
 
   rebuild() {
-    const { source } = get();
-    if (!source) return;
+    if (!get().source) return;
 
     if (buildTimer) clearTimeout(buildTimer);
+    const ticket = ++buildTicket;
     set({ building: true, buildError: null });
 
     buildTimer = setTimeout(() => {
-      const { axes, instances, familyName, built, corners, figures } = get();
+      buildTimer = null;
+      // Read at fire time, so the build always reflects the latest state.
+      const { source, axes, instances, familyName, corners, figures } = get();
+      if (!source) return;
       const issues = validateAxes(axes);
       set({ issues });
       if (issues.length > 0) {
@@ -465,46 +519,63 @@ export const useApp = create<AppState>((set, get) => ({
         return;
       }
 
-      try {
-        const result = buildVariableFont(source, { familyName, axes, instances, corners, figures });
-        const blob = new Blob([result.data.slice().buffer as ArrayBuffer], { type: "font/ttf" });
-        const url = URL.createObjectURL(blob);
-
-        familyCounter += 1;
-        const family = `VFPreview${familyCounter}`;
-        const face = new FontFace(family, `url(${url})`);
-
-        face
-          .load()
-          .then((loaded) => {
-            document.fonts.add(loaded);
-            if (previewFace) document.fonts.delete(previewFace);
-            previewFace = loaded;
-            if (built) URL.revokeObjectURL(built.url);
-            set({
-              built: {
-                url,
-                family,
-                size: result.data.length,
-                masterCount: result.masterCount,
-                warnings: result.warnings,
-              },
-              building: false,
-            });
-          })
-          .catch(() => {
-            set({
-              building: false,
-              buildError:
-                "The browser rejected the generated font. Try reducing the axis ranges — extreme deformations can push coordinates out of range.",
-            });
+      // Builds run in a worker, so the page stays responsive; a newer request
+      // supersedes an older one, and only the latest result is ever applied.
+      const current = () => ticket === buildTicket;
+      buildInWorker(source, { familyName, axes, instances, corners, figures })
+        .then(async (result) => {
+          if (!current()) return;
+          const blob = new Blob([result.data.slice().buffer as ArrayBuffer], { type: "font/ttf" });
+          const url = URL.createObjectURL(blob);
+          familyCounter += 1;
+          const family = `VFPreview${familyCounter}`;
+          let loaded: FontFace;
+          try {
+            loaded = await new FontFace(family, `url(${url})`).load();
+          } catch {
+            URL.revokeObjectURL(url);
+            if (current()) {
+              set({
+                building: false,
+                buildError:
+                  "The browser rejected the generated font. Try reducing the axis ranges — extreme deformations can push coordinates out of range.",
+              });
+            }
+            return;
+          }
+          // A newer build may have started while this one was loading.
+          if (!current()) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          document.fonts.add(loaded);
+          if (previewFace) document.fonts.delete(previewFace);
+          previewFace = loaded;
+          const previous = get().built;
+          if (previous) URL.revokeObjectURL(previous.url);
+          set({
+            built: {
+              url,
+              family,
+              size: result.data.length,
+              masterCount: result.masterCount,
+              warnings: result.warnings,
+            },
+            building: false,
           });
-      } catch (e) {
-        set({ building: false, buildError: e instanceof Error ? e.message : String(e) });
-      }
+        })
+        .catch((e) => {
+          if (isSuperseded(e) || !current()) return;
+          set({ building: false, buildError: e instanceof Error ? e.message : String(e) });
+        });
     }, 260);
   },
 }));
+
+function previousOf(state: AppState): Previous {
+  const { axes, corners, instances, coords, selectedAxisId, familyName, figures, source } = state;
+  return { axes, corners, instances, coords, selectedAxisId, familyName, figures, source };
+}
 
 /** Current preview position expressed as a CSS `font-variation-settings` value. */
 export function variationSettings(axes: AxisDef[], coords: Record<string, number>) {

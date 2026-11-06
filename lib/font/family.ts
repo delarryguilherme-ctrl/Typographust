@@ -132,7 +132,7 @@ export function assembleFamily(faces: SourceFace[], choice: FamilyChoice = {}): 
   // --- outlines ------------------------------------------------------------
   const tolerance = Math.max(0.5, def.upem / 1000);
   const maps = masters.map((m) => matchGlyphs(def, m));
-  const defFrames = def.glyphs.map((g) => frameOf(g, 0));
+  const defFrames = def.glyphs.map((g) => frameOf(g, def.italic ? def.italicAngle : 0));
   const baseGlyphs: Glyph[] = [];
   const aligned: (Glyph | null)[][] = masters.map(() => []);
   const hints: (GlyphHint | null)[][] = masters.map(() => []);
@@ -171,6 +171,8 @@ export function assembleFamily(faces: SourceFace[], choice: FamilyChoice = {}): 
     // CFF keeps names in its charset; TrueType keeps them in post.
     if (def.names) tables.set("post", buildPostWithNames(def.tables.get("post"), def.names));
   }
+
+  if (def.isVariable) stripVariationData(tables);
 
   const single = masters.length === 0;
   const weightMismatch = single && Math.abs(def.measuredWeight - def.declaredWeight) > 100;
@@ -343,4 +345,29 @@ function inkCenter(g: Glyph) {
     xMax = Math.max(xMax, p.x);
   }
   return (xMin + xMax) / 2;
+}
+
+/**
+ * A variable source carries variation data keyed to its own axes: GDEF's
+ * ItemVariationStore (variable kerning and anchors), GSUB/GPOS
+ * FeatureVariations and BASE's store. The export replaces those axes, so the
+ * old data would either point at the wrong axis or fail validation outright
+ * ("Variations: Axis count mismatch" in OTS). Each is cut loose by nulling its
+ * offset; the default values they vary from stay intact.
+ */
+function stripVariationData(tables: TableMap) {
+  const zero32 = (tag: string, at: number, minVersion: number) => {
+    const table = tables.get(tag);
+    if (!table || table.length < at + 4) return;
+    const view = new DataView(table.buffer, table.byteOffset, table.byteLength);
+    if (view.getUint16(0) !== 1 || view.getUint16(2) < minVersion) return;
+    if (view.getUint32(at) === 0) return;
+    const copy = table.slice();
+    new DataView(copy.buffer).setUint32(at, 0);
+    tables.set(tag, copy);
+  };
+  zero32("GDEF", 14, 3); // itemVarStoreOffset
+  zero32("GSUB", 10, 1); // featureVariationsOffset
+  zero32("GPOS", 10, 1);
+  zero32("BASE", 8, 1); // itemVarStoreOffset
 }

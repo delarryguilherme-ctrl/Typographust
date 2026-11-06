@@ -200,7 +200,12 @@ export interface DrawnStyle {
  * between two real weights the axis interpolates real drawings. Italics
  * become the `ital` axis; italics at other weights become corner masters.
  */
-export function makeFamilyAxes(shape: FontShape, faces: DrawnStyle[]): { axes: AxisDef[]; corners: CornerMaster[] } {
+export function makeFamilyAxes(
+  shape: FontShape,
+  faces: DrawnStyle[],
+  /** The default is itself italic (an italics-only upload): no italic axis to add. */
+  italicDefault = false,
+): { axes: AxisDef[]; corners: CornerMaster[] } {
   const uprights = faces.filter((f) => !f.italic);
   const italics = faces.filter((f) => f.italic);
   const def = Math.min(1000, Math.max(1, shape.weight));
@@ -223,6 +228,7 @@ export function makeFamilyAxes(shape: FontShape, faces: DrawnStyle[]): { axes: A
   stops.sort((a, b) => a.at - b.at);
 
   const wght: AxisDef = { id: newId("axis"), tag: "wght", name: "Weight", min, def, max, hidden: false, stops };
+  if (italicDefault) return { axes: [wght], corners: [] };
   if (italics.length === 0) return { axes: [wght, makeAxis("ital", shape)], corners: [] };
 
   const atDefault = italics.find((f) => f.weight === def);
@@ -362,7 +368,7 @@ export function weightName(w: number) {
 }
 
 /** Generates the usual weight (and italic) instance ladder for the current axes. */
-export function defaultInstances(axes: AxisDef[]): NamedInstance[] {
+export function defaultInstances(axes: AxisDef[], italicDefault = false): NamedInstance[] {
   const wght = axes.find((a) => a.tag === "wght");
   const ital = axes.find((a) => a.tag === "ital");
   const slnt = axes.find((a) => a.tag === "slnt");
@@ -375,9 +381,10 @@ export function defaultInstances(axes: AxisDef[]): NamedInstance[] {
   }
 
   const steps = WEIGHT_NAMES.filter(([v]) => v >= wght.min && v <= wght.max);
+  // An italic default is italic at every weight — its ladder is named so.
   const upright = steps.map(([value, name]) => ({
     id: newId("inst"),
-    name,
+    name: italicDefault ? (name === "Regular" ? "Italic" : `${name} Italic`) : name,
     coords: { ...base, wght: value },
   }));
 
