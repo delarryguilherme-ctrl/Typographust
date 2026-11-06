@@ -1,5 +1,5 @@
 import type { Glyph } from "./glyf";
-import type { Master } from "./gvar";
+import { pointOffsets, type Master } from "./gvar";
 
 /**
  * Turns masters at arbitrary design-space locations into gvar regions and
@@ -127,8 +127,8 @@ function computeSupports(locations: number[][]): Region[] {
 }
 
 /**
- * Solves the model and returns gvar-ready masters, each carrying the default
- * outline plus its delta (which is what `buildGvar` and `instantiate` expect).
+ * Solves the model and returns gvar-ready masters: a region and integer deltas
+ * from the default outline for every point and advance.
  */
 export function solveModel(base: Glyph[], specs: MasterSpec[]): Master[] {
   if (specs.length === 0) return [];
@@ -157,56 +157,46 @@ export function solveModel(base: Glyph[], specs: MasterSpec[]): Master[] {
     return w;
   });
 
+  const offsets = pointOffsets(base);
+  const total = offsets[base.length];
   const masters: Master[] = order.map((spec, i) => {
     const region = supports[i];
     const peak = spec.location.map((_, a) => region.get(a)?.[1] ?? 0);
     const start = spec.location.map((_, a) => region.get(a)?.[0] ?? 0);
     const end = spec.location.map((_, a) => region.get(a)?.[2] ?? 0);
-    return { peak, start, end, glyphs: [] as Glyph[] };
+    return {
+      peak,
+      start,
+      end,
+      dx: new Int32Array(total),
+      dy: new Int32Array(total),
+      dAdvance: new Int32Array(base.length),
+    };
   });
 
   base.forEach((glyph, gid) => {
     const n = glyph.points.length;
-    // Deltas per master: x/y per point plus the advance.
-    const dx: Float64Array[] = [];
-    const dy: Float64Array[] = [];
-    const da: number[] = [];
+    const at = offsets[gid];
 
     order.forEach((spec, i) => {
-      const x = new Float64Array(n);
-      const y = new Float64Array(n);
-      let a = 0;
       const value = spec.glyphs[gid];
-      if (value && value.points.length === n) {
-        for (let k = 0; k < n; k++) {
-          x[k] = value.points[k].x - glyph.points[k].x;
-          y[k] = value.points[k].y - glyph.points[k].y;
-        }
-        a = value.advance - glyph.advance;
+      // No drawing here: the delta stays zero, so the model's prediction holds.
+      if (!value || value.points.length !== n) return;
+      const m = masters[i];
+      for (let k = 0; k < n; k++) {
+        let x = value.points[k].x - glyph.points[k].x;
+        let y = value.points[k].y - glyph.points[k].y;
         for (const { j, scalar } of weights[i]) {
-          for (let k = 0; k < n; k++) {
-            x[k] -= dx[j][k] * scalar;
-            y[k] -= dy[j][k] * scalar;
-          }
-          a -= da[j] * scalar;
+          x -= masters[j].dx[at + k] * scalar;
+          y -= masters[j].dy[at + k] * scalar;
         }
         // Rounded at each step, as fontTools does, so errors do not accumulate.
-        for (let k = 0; k < n; k++) {
-          x[k] = Math.round(x[k]);
-          y[k] = Math.round(y[k]);
-        }
-        a = Math.round(a);
+        m.dx[at + k] = Math.round(x);
+        m.dy[at + k] = Math.round(y);
       }
-      dx.push(x);
-      dy.push(y);
-      da.push(a);
-
-      masters[i].glyphs.push({
-        endPts: glyph.endPts,
-        points: glyph.points.map((p, k) => ({ x: p.x + x[k], y: p.y + y[k], on: p.on })),
-        advance: glyph.advance + a,
-        lsb: glyph.lsb,
-      });
+      let a = value.advance - glyph.advance;
+      for (const { j, scalar } of weights[i]) a -= masters[j].dAdvance[gid] * scalar;
+      m.dAdvance[gid] = Math.round(a);
     });
   });
 

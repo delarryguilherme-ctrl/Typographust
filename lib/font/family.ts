@@ -4,6 +4,7 @@ import type { SourceFace } from "./face";
 import { faceLabel } from "./face";
 import type { FontMetrics, Glyph } from "./glyf";
 import { buildPostWithNames } from "./post";
+import { inferWeight } from "./stem";
 import type { TableMap } from "./sfnt";
 
 /**
@@ -89,7 +90,13 @@ export function assembleFamily(faces: SourceFace[], choice: FamilyChoice = {}): 
   const notes: string[] = [];
 
   // --- who belongs ---------------------------------------------------------
-  const anchor = faces.find((f) => f.id === choice.defaultId) ?? faces[0];
+  // Without an explicit choice, the family with the most files wins — not
+  // whichever file happened to come first in the drop.
+  const counts = new Map<string, number>();
+  for (const f of faces) counts.set(f.familyName, (counts.get(f.familyName) ?? 0) + 1);
+  const anchor =
+    faces.find((f) => f.id === choice.defaultId) ??
+    faces.reduce((best, f) => ((counts.get(f.familyName) ?? 0) > (counts.get(best.familyName) ?? 0) ? f : best));
   const reasons = new Map<string, string>();
   for (const f of faces) {
     if (f.id === anchor.id) continue;
@@ -132,7 +139,7 @@ export function assembleFamily(faces: SourceFace[], choice: FamilyChoice = {}): 
   // --- outlines ------------------------------------------------------------
   const tolerance = Math.max(0.5, def.upem / 1000);
   const maps = masters.map((m) => matchGlyphs(def, m));
-  const defFrames = def.glyphs.map((g) => frameOf(g, 0));
+  const defFrames = def.glyphs.map((g) => frameOf(g, def.italic ? def.italicAngle : 0));
   const baseGlyphs: Glyph[] = [];
   const aligned: (Glyph | null)[][] = masters.map(() => []);
   const hints: (GlyphHint | null)[][] = masters.map(() => []);
@@ -171,6 +178,8 @@ export function assembleFamily(faces: SourceFace[], choice: FamilyChoice = {}): 
     // CFF keeps names in its charset; TrueType keeps them in post.
     if (def.names) tables.set("post", buildPostWithNames(def.tables.get("post"), def.names));
   }
+
+  if (def.isVariable) stripVariationData(tables);
 
   const single = masters.length === 0;
   const weightMismatch = single && Math.abs(def.measuredWeight - def.declaredWeight) > 100;
@@ -236,7 +245,11 @@ function placeWeights(faces: SourceFace[], notes: string[]): Map<string, number>
   if (!declaredOk && faces.length > 1) {
     notes.push("The declared weights clash with how heavy the drawings measure, so measured weights place the masters.");
   }
-  for (const f of faces) placement.set(f.id, declaredOk || faces.length === 1 ? f.declaredWeight : f.measuredWeight);
+  // Unrounded, so two different weights cannot collapse onto one value and be
+  // mistaken for the same style.
+  for (const f of faces) {
+    placement.set(f.id, declaredOk || faces.length === 1 ? f.declaredWeight : inferWeight(f.stem, f.upem, 1));
+  }
   return placement;
 }
 
@@ -324,6 +337,11 @@ function assembleGlyph(
   }
 
   const members = otherContours.map((c, k) => (c ? k : -1)).filter((k) => k >= 0);
+  // Nothing matched: keep the default's own points instead of re-emitting it
+  // with every implied point made explicit.
+  if (members.length === 0) {
+    return { base: defCubic ? quadratize(def, tolerance) : def, aligned: others.map(() => null) };
+  }
   const sets = harmonize([baseContours, ...members.map((k) => otherContours[k]!)]);
   const emitted = emitTogether(sets, tolerance);
 
@@ -343,4 +361,29 @@ function inkCenter(g: Glyph) {
     xMax = Math.max(xMax, p.x);
   }
   return (xMin + xMax) / 2;
+}
+
+/**
+ * A variable source carries variation data keyed to its own axes: GDEF's
+ * ItemVariationStore (variable kerning and anchors), GSUB/GPOS
+ * FeatureVariations and BASE's store. The export replaces those axes, so the
+ * old data would either point at the wrong axis or fail validation outright
+ * ("Variations: Axis count mismatch" in OTS). Each is cut loose by nulling its
+ * offset; the default values they vary from stay intact.
+ */
+function stripVariationData(tables: TableMap) {
+  const zero32 = (tag: string, at: number, minVersion: number) => {
+    const table = tables.get(tag);
+    if (!table || table.length < at + 4) return;
+    const view = new DataView(table.buffer, table.byteOffset, table.byteLength);
+    if (view.getUint16(0) !== 1 || view.getUint16(2) < minVersion) return;
+    if (view.getUint32(at) === 0) return;
+    const copy = table.slice();
+    new DataView(copy.buffer).setUint32(at, 0);
+    tables.set(tag, copy);
+  };
+  zero32("GDEF", 14, 3); // itemVarStoreOffset
+  zero32("GSUB", 10, 1); // featureVariationsOffset
+  zero32("GPOS", 10, 1);
+  zero32("BASE", 8, 1); // itemVarStoreOffset
 }

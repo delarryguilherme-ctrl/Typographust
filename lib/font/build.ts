@@ -2,7 +2,7 @@ import { Reader, Writer } from "./binary";
 import { buildSfnt, type TableMap } from "./sfnt";
 import { glyphBounds, writeGlyph, type Glyph } from "./glyf";
 import { applyDeformation, deformation, isIdentity, type Deformation } from "./transform";
-import { buildGvar, type Master } from "./gvar";
+import { buildGvar, pointOffsets, type Master } from "./gvar";
 import { buildFvar, buildStat, type AxisValueEntry, type InstanceEntry } from "./fvar";
 import { buildName, postScriptSafe } from "./name";
 import { normalize, weightName, type AxisDef, type CornerMaster, type NamedInstance } from "./axes";
@@ -201,21 +201,23 @@ export function instantiate(base: Glyph[], masters: Master[], coords: number[]):
   const active = masters
     .map((master) => ({ master, scalar: regionScalar(master, coords) }))
     .filter((entry) => entry.scalar !== 0);
+  const offsets = pointOffsets(base);
 
   return base.map((glyph, gid) => {
     const points = glyph.points.map((p) => ({ ...p }));
     let advance = glyph.advance;
+    const at = offsets[gid];
 
     for (const { master, scalar } of active) {
-      const source = master.glyphs[gid];
       for (let i = 0; i < points.length; i++) {
-        points[i].x += (source.points[i].x - glyph.points[i].x) * scalar;
-        points[i].y += (source.points[i].y - glyph.points[i].y) * scalar;
+        points[i].x += master.dx[at + i] * scalar;
+        points[i].y += master.dy[at + i] * scalar;
       }
-      advance += (source.advance - glyph.advance) * scalar;
+      advance += master.dAdvance[gid] * scalar;
     }
 
-    const xMin = points.length ? Math.min(...points.map((p) => p.x)) : 0;
+    let xMin = Infinity;
+    for (const p of points) if (p.x < xMin) xMin = p.x;
     return {
       endPts: glyph.endPts.slice(),
       points,
@@ -278,7 +280,7 @@ export function buildVariableFont(source: SourceFont, options: BuildOptions): Bu
   const tables: TableMap = new Map(source.tables);
   for (const tag of DROPPED) tables.delete(tag);
   addGlyphTables(tables, source, plan, warnings);
-  rebuildOutlineTables(tables, source, base, masters.map((m) => m.glyphs));
+  rebuildOutlineTables(tables, source, base, masters);
 
   // --- OS/2: describe the default instance ---
   const wghtAxis = axes.find((a) => a.tag === "wght");
@@ -286,7 +288,7 @@ export function buildVariableFont(source: SourceFont, options: BuildOptions): Bu
   patchOs2(tables, source, {
     weight: wghtAxis?.def,
     width: wdthAxis?.def,
-    italic: false,
+    italic: source.italic,
   });
 
   // --- names ---
@@ -294,14 +296,16 @@ export function buildVariableFont(source: SourceFont, options: BuildOptions): Bu
   const family = options.familyName.trim() || source.familyName;
   const psFamily = postScriptSafe(family.replace(/\s+/g, ""));
 
+  // The default instance's style: an italics-only family is italic throughout.
+  const defaultStyle = source.italic ? "Italic" : "Regular";
   names.set(1, family);
-  names.set(2, "Regular");
+  names.set(2, defaultStyle);
   names.set(3, `${family}; ${source.version}; variable`);
-  names.set(4, `${family} Regular`);
+  names.set(4, `${family} ${defaultStyle}`);
   names.set(5, source.version);
-  names.set(6, `${psFamily}-Regular`);
+  names.set(6, `${psFamily}-${defaultStyle}`);
   names.set(16, family);
-  names.set(17, "Regular");
+  names.set(17, defaultStyle);
   names.set(25, psFamily);
 
   const axisNameIDs = axes.map((a) => names.add(a.name.trim() || a.tag));
@@ -316,7 +320,7 @@ export function buildVariableFont(source: SourceFont, options: BuildOptions): Bu
   });
 
   const statValues = buildStatValues(axes, names);
-  const elidedFallbackNameID = names.add("Regular");
+  const elidedFallbackNameID = names.add(defaultStyle);
 
   tables.set("name", names.build());
   tables.set("fvar", buildFvar(axes, axisNameIDs, instanceEntries));
@@ -349,6 +353,9 @@ export function buildStaticFonts(source: SourceFont, options: BuildOptions): Sta
   const { base, masters, plan } = designSpace(source, options);
   const family = options.familyName.trim() || source.familyName;
   const psFamily = postScriptSafe(family.replace(/\s+/g, ""));
+  // Two instances can sanitise to the same PostScript name; a ZIP holding two
+  // files of one name loses one of them on extraction.
+  const usedNames = new Set<string>();
 
   return instances.map((instance) => {
     const coords = axes.map((a) => clampAxis(a, instance.coords[a.tag] ?? a.def));
@@ -359,6 +366,7 @@ export function buildStaticFonts(source: SourceFont, options: BuildOptions): Sta
     const italAxis = axes.findIndex((a) => a.tag === "ital");
     const slntAxis = axes.findIndex((a) => a.tag === "slnt");
     const italic =
+      source.italic ||
       /italic|oblique/i.test(style) ||
       (italAxis >= 0 && coords[italAxis] >= 0.5) ||
       (slntAxis >= 0 && coords[slntAxis] !== axes[slntAxis].def);
@@ -388,7 +396,11 @@ export function buildStaticFonts(source: SourceFont, options: BuildOptions): Sta
         ? "Italic"
         : "Regular";
 
-    const psStyle = postScriptSafe(style.replace(/\s+/g, ""));
+    let psStyle = postScriptSafe(style.replace(/\s+/g, ""));
+    for (let n = 2; usedNames.has(psStyle.toLowerCase()); n++) {
+      psStyle = `${postScriptSafe(style.replace(/\s+/g, ""))}${n}`;
+    }
+    usedNames.add(psStyle.toLowerCase());
     const names = new NameBuilder();
     names.set(1, legacyFamily);
     names.set(2, legacyStyle);
@@ -411,11 +423,11 @@ export function buildStaticFonts(source: SourceFont, options: BuildOptions): Sta
 /**
  * Rewrites glyf, loca, hmtx, hhea, maxp and head from `base`.
  *
- * `alternates` are other glyph sets the font can reach — the synthetic masters
- * in a variable build — which do not go into glyf but must still be covered by
- * the bounding box and the maxp limits.
+ * `masters` are the other outlines the font can reach in a variable build;
+ * they do not go into glyf, but each one at full strength must still fit the
+ * font's bounding box.
  */
-function rebuildOutlineTables(tables: TableMap, source: SourceFont, base: Glyph[], alternates: Glyph[][]) {
+function rebuildOutlineTables(tables: TableMap, source: SourceFont, base: Glyph[], masters: Master[]) {
   const glyfWriter = new Writer(1 << 18);
   const locaOffsets: number[] = [];
   for (const g of base) {
@@ -464,11 +476,10 @@ function rebuildOutlineTables(tables: TableMap, source: SourceFont, base: Glyph[
   // decomposed, unhinted outlines leave every composite and hinting limit at 0.
   let maxPoints = 0;
   let maxContours = 0;
-  for (const set of [base, ...alternates]) {
-    for (const g of set) {
-      maxPoints = Math.max(maxPoints, g.points.length);
-      maxContours = Math.max(maxContours, g.endPts.length);
-    }
+  // Masters share the default's point structure, so the default decides these.
+  for (const g of base) {
+    maxPoints = Math.max(maxPoints, g.points.length);
+    maxContours = Math.max(maxContours, g.endPts.length);
   }
   const maxp = new Writer(32);
   maxp.u32(0x00010000);
@@ -487,15 +498,27 @@ function rebuildOutlineTables(tables: TableMap, source: SourceFont, base: Glyph[
   let yMin = Infinity;
   let xMax = -Infinity;
   let yMax = -Infinity;
-  for (const set of [base, ...alternates]) {
-    for (const g of set) {
-      if (!g.points.length) continue;
-      const b = glyphBounds(g);
-      xMin = Math.min(xMin, b.xMin);
-      yMin = Math.min(yMin, b.yMin);
-      xMax = Math.max(xMax, b.xMax);
-      yMax = Math.max(yMax, b.yMax);
-    }
+  for (const g of base) {
+    if (!g.points.length) continue;
+    const b = glyphBounds(g);
+    xMin = Math.min(xMin, b.xMin);
+    yMin = Math.min(yMin, b.yMin);
+    xMax = Math.max(xMax, b.xMax);
+    yMax = Math.max(yMax, b.yMax);
+  }
+  const offsets = pointOffsets(base);
+  for (const m of masters) {
+    base.forEach((g, gid) => {
+      const at = offsets[gid];
+      for (let i = 0; i < g.points.length; i++) {
+        const x = g.points[i].x + m.dx[at + i];
+        const y = g.points[i].y + m.dy[at + i];
+        if (x < xMin) xMin = x;
+        if (x > xMax) xMax = x;
+        if (y < yMin) yMin = y;
+        if (y > yMax) yMax = y;
+      }
+    });
   }
   if (!Number.isFinite(xMin)) xMin = yMin = xMax = yMax = 0;
 
@@ -514,7 +537,7 @@ function rebuildOutlineTables(tables: TableMap, source: SourceFont, base: Glyph[
 function addGlyphTables(tables: TableMap, source: SourceFont, plan: FigurePlan | null, warnings: string[]) {
   if (!plan) return;
   const count = source.glyphs.length;
-  const added = plan.digits.length;
+  const added = plan.sources.length;
 
   try {
     tables.set("GSUB", addSubstitutions(tables.get("GSUB"), plan.features));
@@ -555,8 +578,8 @@ function addGlyphTables(tables: TableMap, source: SourceFont, plan: FigurePlan |
       heights.push(last);
     }
     for (let i = 0; i < added; i++) {
-      heights.push(heights[plan.digits[i]] ?? last);
-      tsbs.push(tsbs[plan.digits[i]] ?? 0);
+      heights.push(heights[plan.sources[i]] ?? last);
+      tsbs.push(tsbs[plan.sources[i]] ?? 0);
     }
     const w = new Writer(heights.length * 4);
     heights.forEach((h, i) => {

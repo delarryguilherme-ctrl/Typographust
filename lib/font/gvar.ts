@@ -1,7 +1,12 @@
 import { Writer } from "./binary";
 import type { Glyph } from "./glyf";
 
-/** One synthetic master: a region in normalised axis space, plus its glyphs. */
+/**
+ * One master: a region in normalised axis space, plus its deltas from the
+ * default outline. Deltas are stored as flat integer arrays rather than as
+ * whole glyph copies — a large font with a dozen masters would otherwise hold
+ * a dozen copies of every point as objects, which is what exhausts memory.
+ */
 export interface Master {
   /** Normalised coordinates (-1..1), one per axis, in fvar axis order. */
   peak: number[];
@@ -9,7 +14,18 @@ export interface Master {
   start: number[];
   /** Where it stops contributing. */
   end: number[];
-  glyphs: Glyph[];
+  /** Point deltas, all glyphs back to back; `pointOffsets(base)` says where each glyph starts. */
+  dx: Int32Array;
+  dy: Int32Array;
+  /** Advance delta per glyph. */
+  dAdvance: Int32Array;
+}
+
+/** Where each glyph's points start in a master's flat delta arrays (plus a final total). */
+export function pointOffsets(base: Glyph[]): Int32Array {
+  const out = new Int32Array(base.length + 1);
+  for (let i = 0; i < base.length; i++) out[i + 1] = out[i] + base[i].points.length;
+  return out;
 }
 
 const INTERMEDIATE_REGION = 0x4000;
@@ -68,19 +84,19 @@ function packDeltas(deltas: number[]): Uint8Array {
  * Deltas cover the glyph's own points plus the four phantom points, which is
  * how advance width and sidebearings vary along an axis.
  */
-function glyphDeltas(base: Glyph, master: Glyph) {
+function glyphDeltas(base: Glyph, master: Master, gid: number, offset: number) {
   const n = base.points.length;
   const xs = new Array<number>(n + 4).fill(0);
   const ys = new Array<number>(n + 4).fill(0);
 
   for (let i = 0; i < n; i++) {
-    xs[i] = Math.round(master.points[i].x) - Math.round(base.points[i].x);
-    ys[i] = Math.round(master.points[i].y) - Math.round(base.points[i].y);
+    xs[i] = master.dx[offset + i];
+    ys[i] = master.dy[offset + i];
   }
 
   // p0: left sidebearing point, p1: advance point, p2/p3: vertical phantoms.
   xs[n] = 0;
-  xs[n + 1] = Math.round(master.advance) - Math.round(base.advance);
+  xs[n + 1] = master.dAdvance[gid];
 
   const allZero = xs.every((v) => v === 0) && ys.every((v) => v === 0);
   return { xs, ys, allZero };
@@ -101,12 +117,13 @@ export function buildGvar(base: Glyph[], masters: Master[], axisCount: number): 
   // Embedding the peak in each header is legal but is not what shaping engines
   // are exercised against, and it costs `axisCount` extra words per glyph.
   const sharedTuples = masters.map((m) => m.peak);
+  const offsets = pointOffsets(base);
 
   for (let gid = 0; gid < glyphCount; gid++) {
     const tuples: { index: number; intermediate: boolean; master: Master; data: Uint8Array }[] = [];
 
     masters.forEach((master, index) => {
-      const { xs, ys, allZero } = glyphDeltas(base[gid], master.glyphs[gid]);
+      const { xs, ys, allZero } = glyphDeltas(base[gid], master, gid, offsets[gid]);
       if (allZero) return;
 
       const body = new Writer(xs.length * 3 + 32);

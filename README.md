@@ -163,6 +163,9 @@ fonts have no outlines to vary and are refused.
 npm run dev
 ```
 
+Builds run in a Web Worker so the page stays responsive. The worker is bundled separately by esbuild
+(`npm run worker`, run automatically before `dev` and `build`) into `public/build-worker.js`.
+
 To check binary output outside the browser, build a font on the command line and inspect it with
 [fontTools](https://github.com/fonttools/fonttools):
 
@@ -187,4 +190,5 @@ The last argument is the output; everything before it is a source.
   - `transform.ts` the deformation operations · `axes.ts` axis presets and validation
   - `gvar.ts`, `fvar.ts`, `name.ts` table writers · `build.ts` assembles the font
 - `lib/store.ts` — application state, debounced rebuild, live `FontFace` registration
+- `lib/build.worker.ts`, `lib/buildClient.ts` — the build worker and the client that supersedes stale builds
 - `components/` — the editor UI

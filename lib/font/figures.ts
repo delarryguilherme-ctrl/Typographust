@@ -1,6 +1,6 @@
 import type { SourceFont } from "./family";
 import { glyphBounds, type Glyph } from "./glyf";
-import { featureTags, type SubstitutionFeature } from "./gsub";
+import { featureTags, substitutesOf, type SubstitutionFeature } from "./gsub";
 import { uniqueNames } from "./post";
 
 /**
@@ -42,6 +42,9 @@ export interface FigureOptions {
 
 export const DEFAULT_FIGURES: FigureOptions = { enabled: true, tabularWidth: null };
 
+/** Features whose single substitutions produce full-size figure variants. Fractions and super/subscripts are left alone. */
+const VARIANT_FEATURES = /^(zero|onum|lnum|salt|ss\d\d|cv\d\d)$/;
+
 const DIGIT_NAMES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
 
 export function analyzeFigures(source: SourceFont): FigureInfo {
@@ -72,6 +75,12 @@ export function analyzeFigures(source: SourceFont): FigureInfo {
 export interface FigurePlan {
   kind: FigureKind;
   digits: number[];
+  /**
+   * Every glyph that gets a re-spaced copy: the ten digits first, then the
+   * digit variants other features substitute in (slashed zero, oldstyle…).
+   * Spacing is always worked out from the ten digits.
+   */
+  sources: number[];
   /** Glyph id the new figures start at. */
   firstNew: number;
   /** Tabular advance at the default; each master keeps the same offset from its widest digit. */
@@ -88,9 +97,15 @@ export function planFigures(source: SourceFont, options: FigureOptions | undefin
 
   const kind = info.generates;
   const firstNew = source.glyphs.length;
-  const fresh = info.digits.map((_, i) => firstNew + i);
-  const forward = info.digits.map((d, i) => [d, fresh[i]] as [number, number]);
-  const backward = info.digits.map((d, i) => [fresh[i], d] as [number, number]);
+  // The new lookups run after every existing one, so a digit that `zero` or
+  // `onum` already replaced must find its variant in the map too.
+  const variants = substitutesOf(source.tables.get("GSUB"), new Set(info.digits), (tag) =>
+    VARIANT_FEATURES.test(tag),
+  ).filter((g) => g < source.glyphs.length && source.glyphs[g].points.length > 0);
+  const sources = [...info.digits, ...variants];
+  const fresh = sources.map((_, i) => firstNew + i);
+  const forward = sources.map((d, i) => [d, fresh[i]] as [number, number]);
+  const backward = sources.map((d, i) => [fresh[i], d] as [number, number]);
 
   const features: SubstitutionFeature[] =
     kind === "tabular"
@@ -98,11 +113,16 @@ export function planFigures(source: SourceFont, options: FigureOptions | undefin
       : [{ tag: "pnum", pairs: forward }, ...(info.features.includes("tnum") ? [] : [{ tag: "tnum", pairs: backward }])];
 
   const suffix = kind === "tabular" ? ".tf" : ".pf";
-  const baseNames = info.digits.map((gid, i) => (source.glyphNames?.[gid] || DIGIT_NAMES[i]) + suffix);
+  const baseNames = sources.map((gid, i) => (source.glyphNames?.[gid] || DIGIT_NAMES[i] || `glyph${gid}`) + suffix);
   const names = uniqueNames(source.glyphNames ?? [], baseNames);
 
-  const width = Math.max(info.minWidth, Math.round(options.tabularWidth ?? info.widest));
-  return { kind, digits: info.digits, firstNew, width, widest: info.widest, names, features };
+  const inkWidth = (gid: number) => {
+    const b = glyphBounds(source.glyphs[gid]);
+    return b.xMax - b.xMin;
+  };
+  const minWidth = Math.max(info.minWidth, ...variants.map(inkWidth));
+  const width = Math.max(minWidth, Math.round(options.tabularWidth ?? info.widest));
+  return { kind, digits: info.digits, sources, firstNew, width, widest: info.widest, names, features };
 }
 
 function respace(g: Glyph, shift: number, advance: number): Glyph {
@@ -121,18 +141,19 @@ function respace(g: Glyph, shift: number, advance: number): Glyph {
  * single shared advance at every position in the design space.
  */
 export function figureGlyphs(set: (Glyph | null)[], plan: FigurePlan): (Glyph | null)[] {
-  const digits = plan.digits.map((gid) => set[gid]);
-  // A master that lacks any digit leaves all ten to the model, so the ten
-  // stay consistent with one another.
-  if (digits.some((g) => !g)) return digits.map(() => null);
-  const glyphs = digits as Glyph[];
+  const all = plan.sources.map((gid) => set[gid]);
+  // A master that lacks any of them leaves all to the model, so they stay
+  // consistent with one another.
+  if (all.some((g) => !g)) return all.map(() => null);
+  const sources = all as Glyph[];
+  const glyphs = sources.slice(0, plan.digits.length);
 
   if (plan.kind === "tabular") {
     // Equal space is added on both sides, which keeps whatever optical
     // offset the designer built into each digit's sidebearings.
     const widest = Math.max(...glyphs.map((g) => g.advance));
     const width = Math.max(1, Math.round(plan.width + (widest - plan.widest)));
-    return glyphs.map((g) => respace(g, Math.round((width - g.advance) / 2), width));
+    return sources.map((g) => respace(g, Math.round((width - g.advance) / 2), width));
   }
 
   // Proportional: tighten the loose sidebearings that tabular spacing forced
@@ -143,13 +164,14 @@ export function figureGlyphs(set: (Glyph | null)[], plan: FigurePlan): (Glyph | 
   for (let i = 1; i < glyphs.length; i++) if (inkOf(i) > inkOf(ref)) ref = i;
   const refSide = Math.round((bounds[ref].xMin + (glyphs[ref].advance - bounds[ref].xMax)) / 2);
 
-  return glyphs.map((g, i) => {
+  return sources.map((g) => {
     if (!g.points.length) return respace(g, 0, g.advance);
-    const lsb = bounds[i].xMin;
-    const rsb = g.advance - bounds[i].xMax;
+    const b = glyphBounds(g);
+    const lsb = b.xMin;
+    const rsb = g.advance - b.xMax;
     const newL = Math.min(lsb, refSide);
     const newR = Math.min(rsb, refSide);
-    return respace(g, newL - lsb, Math.max(1, newL + inkOf(i) + newR));
+    return respace(g, newL - lsb, Math.max(1, newL + (b.xMax - b.xMin) + newR));
   });
 }
 

@@ -56,7 +56,7 @@ async function main() {
   let axes: AxisDef[];
   let corners: CornerMaster[];
   if (source.drawn.length > 0) {
-    ({ axes, corners } = makeFamilyAxes(source.shape, source.drawn));
+    ({ axes, corners } = makeFamilyAxes(source.shape, source.drawn, source.italic));
   } else {
     axes = [makeAxis("wght", source.shape), makeAxis("slnt", source.shape)];
     corners = [];
@@ -77,7 +77,7 @@ async function main() {
   }
   for (const c of corners) console.log(`corner: ${JSON.stringify(c.coords)}`);
 
-  const options = { familyName: "Smoke Test", axes, corners, instances: defaultInstances(axes), figures: DEFAULT_FIGURES };
+  const options = { familyName: "Smoke Test", axes, corners, instances: defaultInstances(axes, source.italic), figures: DEFAULT_FIGURES };
 
   const buildStarted = Date.now();
   const result = buildVariableFont(source, options);
