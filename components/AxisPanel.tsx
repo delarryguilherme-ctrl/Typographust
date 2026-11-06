@@ -247,13 +247,17 @@ function AxisCard({ axis }: { axis: AxisDef }) {
                   onSelect={selectStop}
                 />
 
-                {axis.tag === "ital" && (
+                {axis.tag === "ital" && !axis.stops.some((s) => s.faceId) && (
                   <p className="mt-2 px-0.5 text-[10.5px] leading-relaxed text-[var(--faint)]">
                     Italic here is the roman sheared over, not a cursive redrawing — no single-storey{" "}
                     <span className="font-mono">a</span>, no entry strokes. Passable on a geometric sans, plainly
-                    wrong on a serif.
+                    wrong on a serif. Upload the italic to use the real one.
                   </p>
                 )}
+
+                {axis.tag === "ital" && <CornerList />}
+
+                {stop?.faceId && <DrawnNote faceId={stop.faceId} />}
 
                 {strain && (
                   <p className="mt-2 rounded-lg border border-[var(--warn)]/25 bg-[var(--warn)]/8 px-2.5 py-1.5 text-[10.5px] leading-relaxed text-[var(--warn)]">
@@ -312,6 +316,44 @@ function AxisCard({ axis }: { axis: AxisDef }) {
   );
 }
 
+/** What a drawn master is made of, and what its sliders do. */
+function DrawnNote({ faceId }: { faceId: string }) {
+  const face = useApp((s) => s.source?.drawn.find((d) => d.id === faceId));
+  const total = useApp((s) => s.source?.glyphs.length ?? 0);
+  if (!face) return null;
+  const missing = total - face.drawn;
+  return (
+    <p className="mt-2 rounded-lg border border-white/8 bg-white/[0.03] px-2.5 py-1.5 text-[10.5px] leading-relaxed text-[var(--muted)]">
+      Drawn master — <span className="text-[var(--text)]">{face.label}</span>. {face.drawn.toLocaleString()} of{" "}
+      {total.toLocaleString()} glyphs use the drawing
+      {missing > 0 ? `; ${missing.toLocaleString()} could not be matched point for point and are synthesised here` : ""}.
+      The controls below adjust on top of the drawing.
+    </p>
+  );
+}
+
+/** Drawn masters off the axes, such as a Bold Italic. */
+function CornerList() {
+  const corners = useApp((s) => s.corners);
+  const drawn = useApp((s) => s.source?.drawn);
+  if (corners.length === 0) return null;
+  return (
+    <div className="mt-2 px-0.5 text-[10.5px] leading-relaxed text-[var(--faint)]">
+      Also drawn, between axes:{" "}
+      {corners.map((c, i) => {
+        const face = drawn?.find((d) => d.id === c.faceId);
+        return (
+          <span key={c.id} className="text-[var(--muted)]">
+            {i > 0 && ", "}
+            {face?.label ?? "?"} <span className="font-mono">({Object.entries(c.coords).map(([t, v]) => `${t} ${v}`).join(", ")})</span>
+          </span>
+        );
+      })}
+      .
+    </div>
+  );
+}
+
 interface Field {
   key: keyof Deformation;
   label: string;
@@ -351,14 +393,16 @@ function StopChips({
 }) {
   const removeStop = useApp((s) => s.removeStop);
   const shape = useApp((s) => s.source?.shape);
+  const drawn = useApp((s) => s.source?.drawn);
   const entries = [
     ...axis.stops.map((s) => ({
       kind: "stop" as const,
       at: s.at,
       id: s.id,
       strain: shape ? masterStrain(s, shape) : null,
+      face: s.faceId ? drawn?.find((d) => d.id === s.faceId) : undefined,
     })),
-    { kind: "default" as const, at: axis.def, id: "default", strain: null },
+    { kind: "default" as const, at: axis.def, id: "default", strain: null, face: undefined },
   ].sort((a, b) => a.at - b.at);
 
   return (
@@ -367,7 +411,7 @@ function StopChips({
         entry.kind === "default" ? (
           <span
             key="default"
-            title="The axis default — this is the outline you uploaded"
+            title="The axis default — the outline of the default source"
             className="rounded-md border border-dashed border-white/14 px-1.5 py-1 font-mono text-[11px] tabular-nums text-[var(--faint)]"
           >
             {entry.at}
@@ -376,9 +420,10 @@ function StopChips({
           <span key={entry.id} className="group relative">
             <button
               onClick={() => onSelect(entry.id, entry.at)}
-              title={entry.strain ?? undefined}
+              title={entry.face ? `Drawn: ${entry.face.label} (${entry.face.fileName})` : (entry.strain ?? "Synthesised")}
               className={cx(
                 "rounded-md border px-1.5 py-1 font-mono text-[11px] tabular-nums transition-colors",
+                entry.face && "border-solid underline decoration-white/40 underline-offset-[3px]",
                 entry.id === selectedId
                   ? "border-white/30 bg-white/[0.12] text-[var(--text)]"
                   : "border-white/8 bg-white/[0.03] text-[var(--muted)] hover:border-white/20 hover:text-[var(--text)]",

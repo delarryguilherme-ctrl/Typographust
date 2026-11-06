@@ -74,7 +74,7 @@ function readLoca(tables: TableMap, numGlyphs: number, indexToLocFormat: number)
   return offsets;
 }
 
-function readHmtx(tables: TableMap, numGlyphs: number) {
+export function readHmtx(tables: TableMap, numGlyphs: number) {
   const hhea = tables.get("hhea")!;
   const hr = new Reader(hhea);
   hr.seek(34);

@@ -1,7 +1,8 @@
 # Axis — variable font editor
 <img width="1623" height="1302" alt="screencapture-delarryguilherme-ctrl-github-io-Typographust-2026-08-17-17_07_19" src="https://github.com/user-attachments/assets/74724092-0284-42be-b38d-8eef377f1c42" />
-Upload a static TrueType font, define variation axes, preview them live, and export a single
-variable `.ttf`.
+Upload a static font — or several weights and italics of one family — define variation axes, preview
+them live, and export a single variable `.ttf`. Reads `.ttf`, `.otf` (CFF and CFF2), `.woff`, `.woff2`,
+`.ttc` and `.otc`.
 
 ## What it actually does
 
@@ -59,6 +60,57 @@ A master only shows up in the preview at its own coordinate, so selecting one �
 of its controls — moves the preview there. Adding a master copies whatever the axis already
 produces at that coordinate, so inserting one changes nothing until you edit it.
 
+## Uploading a family
+
+One master can only be stretched so far. Drop the weights you have — Regular and Bold, say, plus the
+italics — and they become **drawn masters**: real outlines written as gvar deltas, so the axis
+interpolates between drawings instead of synthesising them.
+
+- The default is the upright closest to 400; its tables (cmap, kerning, features, names) are the ones
+  carried into the export. Every other face only contributes outlines and advances.
+- Uprights land on `wght` at their declared weight. If the declared weights clash with how heavy the
+  drawings measure, the measurements place them instead.
+- An italic at the default weight becomes the `ital` master. Italics at other weights become **corner
+  masters** — a Bold Italic at (wght 700, ital 1) — whose regions span both axes, exactly as fontTools'
+  `VariationModel` lays them out.
+- Synthetic stops are only added outside the drawn range, and each one deforms the nearest drawn
+  master: a Black past an uploaded Bold starts from the Bold drawing, not from the Regular.
+- Faces from another family, another width or another units-per-em are listed but left out.
+
+Glyphs are matched by code point, then by glyph name, then by position when two fonts share a glyph
+order. Outlines then have to correspond point for point, which statics of one family often do not
+quite: a CFF optimiser turns a flat curve into a line in one weight only, or TrueType leaves an
+on-curve point implied in one and explicit in the other. Contours are therefore matched by position,
+size and winding (the outside of an "o" and its counter share a centre), start points are found by
+rotation, and segments are promoted to the highest degree any master uses. CFF outlines are converted
+to quadratics jointly, so every master splits a curve the same number of times.
+
+A glyph that still cannot be matched falls back to synthesis at that master — the measured stem
+difference as a weight offset, the italic angle as a shear — but keeps the drawn glyph's real advance
+and ink centre. The Sources panel shows how much of each face is drawn.
+
+## Tabular and proportional figures
+
+Tables need digits that share one advance (`tnum`); running text reads better with digits spaced to
+their shapes (`pnum`). Design tools only offer the choice when the font has both — Figma's Type details
+→ Numbers lists Monospace and Proportional from exactly these features.
+
+Most fonts ship one kind as the default figures. The editor generates the other kind as ten new glyphs
+(`zero.tf` … or `zero.pf` …) and the GSUB features that switch between them:
+
+- **Tabular**: every digit gets the same advance — the widest digit by default, adjustable — with the
+  extra space split evenly on both sides, which keeps the optical offset built into each digit's
+  sidebearings.
+- **Proportional**: loose sidebearings (the 1 above all) are tightened to what the widest digit uses.
+
+Only spacing changes; the drawings are not touched. The new glyphs are derived inside every master
+from that master's own digits, so tabular figures keep one shared advance at every point in the design
+space.
+
+The source's GSUB is kept byte for byte. A new header, script list, feature list and lookup list are
+written in front of it, and each original lookup becomes an Extension lookup pointing into the
+untouched subtables — lookup indices do not change, so nothing that already worked stops working.
+
 ## The slider
 
 Every numeric control is the same component (`components/Slider.tsx`): the track is the whole
@@ -100,8 +152,10 @@ same name that is already installed.
 Composite glyphs are decomposed and TrueType hinting is dropped (`fpgm`, `prep`, `cvt `), since
 decomposed and deformed outlines can't honour the original instructions.
 
-Only TrueType outlines are supported. CFF-based `.otf` files and `.ttc` collections are rejected
-with a message rather than silently mangled.
+CFF and CFF2 outlines are converted to TrueType quadratics within a tolerance of one unit per
+thousand em; CFF2 sources are read at their default instance. Every container — WOFF, WOFF2 (Brotli
+and the transformed `glyf`/`hmtx`), TTC/OTC — is unwrapped to plain tables first. Bitmap- and SVG-only
+fonts have no outlines to vary and are refused.
 
 ## Development
 
@@ -114,13 +168,22 @@ To check binary output outside the browser, build a font on the command line and
 
 ```bash
 npx tsx scripts/smoke.ts C:/Windows/Fonts/arial.ttf out.ttf
+npx tsx scripts/smoke.ts Inter-Regular.otf Inter-Bold.otf Inter-Italic.woff2 out.ttf
 ```
+
+The last argument is the output; everything before it is a source.
 
 ## Layout
 
 - `lib/font/` — the font engine, browser-safe and free of React
   - `binary.ts` big-endian reader/writer · `sfnt.ts` table directory and checksums
+  - `container.ts` sfnt, TTC/OTC, WOFF and WOFF2 unwrapping · `cff.ts` CFF/CFF2 charstrings
   - `glyf.ts` outline parsing, composite decomposition, glyph serialisation
+  - `face.ts` reads and measures one uploaded font · `family.ts` matches faces into masters
+  - `curves.ts` contour alignment, segment promotion, cubic → quadratic
+  - `model.ts` master locations → gvar regions and deltas (fontTools' `VariationModel`)
+  - `figures.ts` tabular/proportional figures · `gsub.ts` adds features to an existing GSUB
+  - `cmap.ts`, `post.ts`, `stdnames.ts` code points and glyph names
   - `transform.ts` the deformation operations · `axes.ts` axis presets and validation
   - `gvar.ts`, `fvar.ts`, `name.ts` table writers · `build.ts` assembles the font
 - `lib/store.ts` — application state, debounced rebuild, live `FontFace` registration

@@ -1,40 +1,6 @@
-import { Reader, Writer } from "./binary";
+import { Writer } from "./binary";
 
 export type TableMap = Map<string, Uint8Array>;
-
-/** Reads the SFNT table directory into a tag -> bytes map. */
-export function parseSfnt(data: Uint8Array): TableMap {
-  const r = new Reader(data);
-  const version = r.u32();
-
-  if (version === 0x74746366) {
-    throw new Error("TrueType Collections (.ttc) are not supported. Upload a single .ttf.");
-  }
-  if (version === 0x4f54544f) {
-    throw new Error(
-      "This is a CFF/OpenType font (.otf outlines). Only TrueType (glyf) outlines can be made variable here.",
-    );
-  }
-  if (version !== 0x00010000 && version !== 0x74727565) {
-    throw new Error("Not a recognised TrueType font file.");
-  }
-
-  const numTables = r.u16();
-  r.skip(6); // searchRange, entrySelector, rangeShift
-
-  const tables: TableMap = new Map();
-  for (let i = 0; i < numTables; i++) {
-    const tag = r.tag();
-    r.u32(); // checksum, recomputed on write
-    const offset = r.u32();
-    const length = r.u32();
-    if (offset + length > data.length) {
-      throw new Error(`Table '${tag}' is truncated — the file looks corrupt.`);
-    }
-    tables.set(tag, data.subarray(offset, offset + length));
-  }
-  return tables;
-}
 
 function checksum(bytes: Uint8Array) {
   let sum = 0;

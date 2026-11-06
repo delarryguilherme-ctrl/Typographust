@@ -1,30 +1,20 @@
-import { Writer } from "./binary";
-import { buildSfnt, parseSfnt, type TableMap } from "./sfnt";
-import { glyphBounds, parseGlyphs, writeGlyph, type FontMetrics, type Glyph } from "./glyf";
-import { applyDeformation } from "./transform";
+import { Reader, Writer } from "./binary";
+import { buildSfnt, type TableMap } from "./sfnt";
+import { glyphBounds, writeGlyph, type Glyph } from "./glyf";
+import { applyDeformation, deformation, isIdentity, type Deformation } from "./transform";
 import { buildGvar, type Master } from "./gvar";
 import { buildFvar, buildStat, type AxisValueEntry, type InstanceEntry } from "./fvar";
-import { buildName, getName, parseName, postScriptSafe } from "./name";
-import { normalize, weightName, type AxisDef, type FontShape, type NamedInstance } from "./axes";
-import { inferWeight, measureStem } from "./stem";
+import { buildName, postScriptSafe } from "./name";
+import { normalize, weightName, type AxisDef, type CornerMaster, type NamedInstance } from "./axes";
+import { unpackFontFile } from "./container";
+import { readFace, type SourceFace } from "./face";
+import type { DrawnFace, GlyphHint, SourceFont } from "./family";
+import { analyzeFigures, equalizeDigits, figureGlyphs, planFigures, type FigureOptions, type FigurePlan } from "./figures";
+import { addSubstitutions } from "./gsub";
+import { solveModel, type MasterSpec } from "./model";
+import { buildPostWithNames, parsePostNames } from "./post";
 
-export interface SourceFont {
-  tables: TableMap;
-  glyphs: Glyph[];
-  metrics: FontMetrics;
-  familyName: string;
-  subfamilyName: string;
-  version: string;
-  /** What OS/2 claims the weight is. */
-  declaredWeight: number;
-  /** Measured stem and the weight it implies — the axis presets use this. */
-  shape: FontShape;
-  /** Set when the drawing disagrees with the declared weight enough to matter. */
-  weightMismatch: boolean;
-  isAlreadyVariable: boolean;
-  fileName: string;
-  fileSize: number;
-}
+export type { SourceFont } from "./family";
 
 /** Tables that describe hinting or bitmap caches we can no longer honour. */
 const DROPPED = [
@@ -45,88 +35,137 @@ const DROPPED = [
   "STAT",
 ];
 
-export function loadSource(data: Uint8Array, fileName: string): SourceFont {
-  const tables = parseSfnt(data);
-  const { glyphs, metrics } = parseGlyphs(tables);
-  const names = parseName(tables.get("name"));
-
-  const os2 = tables.get("OS/2");
-  let declared = 400;
-  if (os2 && os2.length >= 6) {
-    const value = (os2[4] << 8) | os2[5];
-    if (value >= 1 && value <= 1000) declared = value;
-  }
-
-  // Fonts misdeclare their weight often enough that the drawing gets the last
-  // word: a Light labelled 400 would otherwise anchor the whole ramp wrongly.
-  const stem = measureStem(glyphs, metrics.unitsPerEm);
-  const measured = inferWeight(stem, metrics.unitsPerEm);
-  const weightMismatch = Math.abs(measured - declared) > 100;
-
-  return {
-    tables,
-    glyphs,
-    metrics,
-    familyName: getName(names, 16) ?? getName(names, 1) ?? fileName.replace(/\.[^.]+$/, ""),
-    subfamilyName: getName(names, 17) ?? getName(names, 2) ?? "Regular",
-    version: getName(names, 5) ?? "Version 1.000",
-    declaredWeight: declared,
-    shape: { upem: metrics.unitsPerEm, stem, weight: weightMismatch ? measured : declared },
-    weightMismatch,
-    isAlreadyVariable: tables.has("fvar"),
-    fileName,
-    fileSize: data.length,
-  };
+/** Reads every font in a file — a collection yields several. */
+export async function loadFaces(data: Uint8Array, fileName: string): Promise<SourceFace[]> {
+  const raws = await unpackFontFile(data);
+  return raws.map((raw) => readFace(raw, fileName, data.length));
 }
 
 /**
- * Turns each axis stop into a master with its own region.
- *
- * With stops at normalised 0.5 and 1.0, the 0.5 master covers 0 → 0.5 → 1.0 and
- * the 1.0 master covers 0.5 → 1.0 → 1.0. Each master's deltas stay relative to
- * the default outline, and the overlapping regions blend them linearly in
- * between — so a stop can be reshaped without disturbing its neighbours.
+ * The deformation that stands in for a drawn master on the glyphs whose
+ * outlines could not be matched: the measured stem difference as a weight
+ * offset, and the italic angle as a shear.
  */
-export function buildMasters(source: SourceFont, axes: AxisDef[]): Master[] {
-  const masters: Master[] = [];
-  const zeros = () => new Array(axes.length).fill(0);
+export function fallbackDeformation(source: SourceFont, face: DrawnFace): Deformation {
+  return deformation({
+    weight: (face.shape.stem - source.shape.stem) / 2,
+    slant: face.italic && !source.italic ? -face.italicAngle : 0,
+  });
+}
 
-  axes.forEach((axis, index) => {
-    const placed = axis.stops
-      .filter((stop) => stop.at !== axis.def && stop.at >= axis.min && stop.at <= axis.max)
-      .map((stop) => ({ stop, coord: normalize(axis, stop.at) }))
-      .filter((entry) => entry.coord !== 0);
+/** Gives a stand-in outline the drawn glyph's real advance and ink centre. */
+function fitToHint(g: Glyph, hint: GlyphHint): Glyph {
+  if (g.points.length === 0) return { ...g, advance: hint.advance };
+  let xMin = Infinity;
+  let xMax = -Infinity;
+  for (const p of g.points) {
+    xMin = Math.min(xMin, p.x);
+    xMax = Math.max(xMax, p.x);
+  }
+  const shift = Math.round(hint.center - (xMin + xMax) / 2);
+  return {
+    endPts: g.endPts,
+    points: g.points.map((p) => ({ x: p.x + shift, y: p.y, on: p.on })),
+    advance: Math.round(hint.advance),
+    lsb: g.lsb + shift,
+  };
+}
 
-    // Each side of the default is an independent chain of regions.
-    const negative = placed.filter((e) => e.coord < 0).sort((a, b) => b.coord - a.coord);
-    const positive = placed.filter((e) => e.coord > 0).sort((a, b) => a.coord - b.coord);
+export interface DesignSpace {
+  /** Default glyphs, including any generated figures. */
+  base: Glyph[];
+  masters: Master[];
+  plan: FigurePlan | null;
+}
 
-    const emit = (chain: typeof placed, limit: number) => {
-      chain.forEach((entry, i) => {
-        const inner = i === 0 ? 0 : chain[i - 1].coord;
-        const outer = i === chain.length - 1 ? limit : chain[i + 1].coord;
+/**
+ * Builds every master the axes describe and solves them into gvar regions.
+ *
+ * Drawn masters (uploaded weights and italics) are solved first. Synthetic
+ * stops are then applied on top of whatever the drawn masters produce at
+ * their position — clamped to the drawn range — so a Black synthesised past
+ * an uploaded Bold starts from the Bold drawing, not from the Regular.
+ */
+export function designSpace(source: SourceFont, options: BuildOptions): DesignSpace {
+  const { axes } = options;
+  const plan = planFigures(source, options.figures);
+  const figures = analyzeFigures(source);
+  const tabularDigits = figures.tabular ? figures.digits : null;
+  const augment = (raw: (Glyph | null)[]): (Glyph | null)[] => {
+    const set = tabularDigits ? equalizeDigits(raw, tabularDigits) : raw;
+    return plan ? [...set, ...figureGlyphs(set, plan)] : set;
+  };
+  const base = augment(source.glyphs) as Glyph[];
 
-        const peak = zeros();
-        const start = zeros();
-        const end = zeros();
-        peak[index] = entry.coord;
-        start[index] = Math.min(inner, outer);
-        end[index] = Math.max(inner, outer);
+  const faces = new Map(source.drawn.map((d) => [d.id, d]));
+  const zeros = () => new Array<number>(axes.length).fill(0);
+  const extent = axes.map(() => ({ lo: 0, hi: 0 }));
+  const drawn: MasterSpec[] = [];
+  const seen = new Set<string>();
+  const place = (location: number[], glyphs: (Glyph | null)[]) => {
+    const key = location.join(",");
+    if (seen.has(key) || location.every((v) => v === 0)) return false;
+    seen.add(key);
+    drawn.push({ location, glyphs });
+    return true;
+  };
 
-        masters.push({
-          peak,
-          start,
-          end,
-          glyphs: source.glyphs.map((g) => applyDeformation(g, entry.stop.deformation)),
-        });
-      });
-    };
-
-    emit(negative, -1);
-    emit(positive, 1);
+  axes.forEach((axis, a) => {
+    for (const stop of axis.stops) {
+      const face = stop.faceId ? faces.get(stop.faceId) : undefined;
+      if (!face) continue;
+      const location = zeros();
+      location[a] = normalize(axis, stop.at);
+      const fallback = fallbackDeformation(source, face);
+      let set = augment(
+        face.glyphs.map((g, gid) => {
+          if (g) return g;
+          const stand = applyDeformation(source.glyphs[gid], fallback);
+          return face.hints[gid] ? fitToHint(stand, face.hints[gid]!) : stand;
+        }),
+      );
+      if (!isIdentity(stop.deformation)) set = set.map((g) => g && applyDeformation(g, stop.deformation));
+      if (place(location, set)) {
+        extent[a].lo = Math.min(extent[a].lo, location[a]);
+        extent[a].hi = Math.max(extent[a].hi, location[a]);
+      }
+    }
   });
 
-  return masters;
+  // Corners are placed after the on-axis masters, so a corner glyph that has
+  // no matching outline can start from what those masters predict there.
+  const onAxis = solveModel(base, drawn);
+  for (const corner of options.corners ?? []) {
+    const face = faces.get(corner.faceId);
+    if (!face) continue;
+    if (!Object.keys(corner.coords).every((tag) => axes.some((a) => a.tag === tag))) continue;
+    const location = axes.map((axis) => (axis.tag in corner.coords ? normalize(axis, corner.coords[axis.tag]) : 0));
+    if (location.filter((v) => v !== 0).length < 2) continue;
+    const predicted = instantiate(base, onAxis, location);
+    place(
+      location,
+      augment(face.glyphs.map((g, gid) => g ?? (face.hints[gid] ? fitToHint(predicted[gid], face.hints[gid]!) : null))),
+    );
+  }
+
+  const drawnMasters = solveModel(base, drawn);
+
+  const synthetic: MasterSpec[] = [];
+  axes.forEach((axis, a) => {
+    for (const stop of axis.stops) {
+      if (stop.faceId && faces.has(stop.faceId)) continue;
+      const v = normalize(axis, stop.at);
+      if (v === 0) continue;
+      const location = zeros();
+      location[a] = v;
+      const anchor = zeros();
+      anchor[a] = Math.min(extent[a].hi, Math.max(extent[a].lo, v));
+      const basis = anchor[a] === 0 ? base : instantiate(base, drawnMasters, anchor);
+      synthetic.push({ location, glyphs: basis.map((g) => applyDeformation(g, stop.deformation)) });
+    }
+  });
+
+  return { base, masters: solveModel(base, [...drawn, ...synthetic]), plan };
 }
 
 /**
@@ -190,6 +229,9 @@ export interface BuildOptions {
   familyName: string;
   axes: AxisDef[];
   instances: NamedInstance[];
+  /** Drawn masters that sit off the axes, e.g. a Bold Italic at (wght 700, ital 1). */
+  corners?: CornerMaster[];
+  figures?: FigureOptions;
 }
 
 export interface BuildResult {
@@ -224,8 +266,7 @@ class NameBuilder {
 export function buildVariableFont(source: SourceFont, options: BuildOptions): BuildResult {
   const { axes, instances } = options;
   const warnings: string[] = [];
-  const base = source.glyphs;
-  const masters = buildMasters(source, axes);
+  const { base, masters, plan } = designSpace(source, options);
 
   if (masters.length === 0) {
     warnings.push("No axis produces any outline change, so the exported font has no variation.");
@@ -236,6 +277,7 @@ export function buildVariableFont(source: SourceFont, options: BuildOptions): Bu
 
   const tables: TableMap = new Map(source.tables);
   for (const tag of DROPPED) tables.delete(tag);
+  addGlyphTables(tables, source, plan, warnings);
   rebuildOutlineTables(tables, source, base, masters.map((m) => m.glyphs));
 
   // --- OS/2: describe the default instance ---
@@ -304,14 +346,14 @@ const RIBBI = new Set(["Regular", "Bold"]);
  */
 export function buildStaticFonts(source: SourceFont, options: BuildOptions): StaticFont[] {
   const { axes, instances } = options;
-  const masters = buildMasters(source, axes);
+  const { base, masters, plan } = designSpace(source, options);
   const family = options.familyName.trim() || source.familyName;
   const psFamily = postScriptSafe(family.replace(/\s+/g, ""));
 
   return instances.map((instance) => {
     const coords = axes.map((a) => clampAxis(a, instance.coords[a.tag] ?? a.def));
     const normalised = axes.map((a, i) => normalize(a, coords[i]));
-    const glyphs = instantiate(source.glyphs, masters, normalised);
+    const glyphs = instantiate(base, masters, normalised);
 
     const style = instance.name.trim() || "Regular";
     const italAxis = axes.findIndex((a) => a.tag === "ital");
@@ -328,6 +370,7 @@ export function buildStaticFonts(source: SourceFont, options: BuildOptions): Sta
 
     const tables: TableMap = new Map(source.tables);
     for (const tag of DROPPED) tables.delete(tag);
+    addGlyphTables(tables, source, plan, []);
     rebuildOutlineTables(tables, source, glyphs, []);
     patchOs2(tables, source, {
       weight: wghtIndex >= 0 ? coords[wghtIndex] : undefined,
@@ -417,35 +460,26 @@ function rebuildOutlineTables(tables: TableMap, source: SourceFont, base: Glyph[
   hheaView.setUint16(34, numGlyphs);
   tables.set("hhea", hhea);
 
-  // Outlines are decomposed, so composite and hinting limits are all zero.
-  const maxp = new Uint8Array(source.tables.get("maxp")!);
-  if (maxp.length >= 32) {
-    const view = new DataView(maxp.buffer);
-    let maxPoints = 0;
-    let maxContours = 0;
-    for (const set of [base, ...alternates]) {
-      for (const g of set) {
-        maxPoints = Math.max(maxPoints, g.points.length);
-        maxContours = Math.max(maxContours, g.endPts.length);
-      }
+  // Rebuilt from scratch: a CFF source only has the 6-byte version 0.5, and
+  // decomposed, unhinted outlines leave every composite and hinting limit at 0.
+  let maxPoints = 0;
+  let maxContours = 0;
+  for (const set of [base, ...alternates]) {
+    for (const g of set) {
+      maxPoints = Math.max(maxPoints, g.points.length);
+      maxContours = Math.max(maxContours, g.endPts.length);
     }
-
-    // Offset 4 is numGlyphs and must be left alone.
-    view.setUint16(6, Math.min(0xffff, maxPoints));
-    view.setUint16(8, Math.min(0xffff, maxContours));
-    view.setUint16(10, 0); // maxCompositePoints
-    view.setUint16(12, 0); // maxCompositeContours
-    view.setUint16(14, 1); // maxZones
-    view.setUint16(16, 0); // maxTwilightPoints
-    view.setUint16(18, 0); // maxStorage
-    view.setUint16(20, 0); // maxFunctionDefs
-    view.setUint16(22, 0); // maxInstructionDefs
-    view.setUint16(24, 0); // maxStackElements
-    view.setUint16(26, 0); // maxSizeOfInstructions
-    view.setUint16(28, 0); // maxComponentElements
-    view.setUint16(30, 0); // maxComponentDepth
   }
-  tables.set("maxp", maxp);
+  const maxp = new Writer(32);
+  maxp.u32(0x00010000);
+  maxp.u16(numGlyphs);
+  maxp.u16(Math.min(0xffff, maxPoints));
+  maxp.u16(Math.min(0xffff, maxContours));
+  maxp.u16(0); // maxCompositePoints
+  maxp.u16(0); // maxCompositeContours
+  maxp.u16(1); // maxZones
+  for (let i = 0; i < 8; i++) maxp.u16(0); // twilight points through component depth
+  tables.set("maxp", maxp.toBytes());
 
   const head = new Uint8Array(source.tables.get("head")!);
   const headView = new DataView(head.buffer);
@@ -471,6 +505,69 @@ function rebuildOutlineTables(tables: TableMap, source: SourceFont, base: Glyph[
   headView.setInt16(42, clampI16(yMax));
   headView.setInt16(50, 1); // indexToLocFormat: long
   tables.set("head", head);
+}
+
+/**
+ * Brings the tables that are indexed by glyph id up to date with the glyphs
+ * the build appends (generated figures), and wires those glyphs into GSUB.
+ */
+function addGlyphTables(tables: TableMap, source: SourceFont, plan: FigurePlan | null, warnings: string[]) {
+  if (!plan) return;
+  const count = source.glyphs.length;
+  const added = plan.digits.length;
+
+  try {
+    tables.set("GSUB", addSubstitutions(tables.get("GSUB"), plan.features));
+  } catch (e) {
+    warnings.push(
+      `The figures were added, but the font's GSUB could not take the ${plan.features.map((f) => f.tag).join("/")} feature: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+  }
+
+  const post = tables.get("post");
+  const names = parsePostNames(post, count);
+  if (names) {
+    tables.set("post", buildPostWithNames(post, [...names, ...plan.names]));
+  } else if (post && post.length >= 32 && new Reader(post).u32() !== 0x00030000) {
+    // Any other format lists glyphs by index and would now be short; format 3 lists none.
+    const v3 = post.slice(0, 32);
+    new DataView(v3.buffer).setUint32(0, 0x00030000);
+    tables.set("post", v3);
+  }
+
+  const vhea = tables.get("vhea");
+  const vmtx = tables.get("vmtx");
+  if (vhea && vmtx && vhea.length >= 36) {
+    const numLong = new Reader(vhea, 34).u16();
+    const r = new Reader(vmtx);
+    const heights: number[] = [];
+    const tsbs: number[] = [];
+    let last = 0;
+    for (let gid = 0; gid < count; gid++) {
+      if (gid < numLong && r.pos + 4 <= vmtx.length) {
+        last = r.u16();
+        tsbs.push(r.i16());
+      } else {
+        tsbs.push(r.pos + 2 <= vmtx.length ? r.i16() : 0);
+      }
+      heights.push(last);
+    }
+    for (let i = 0; i < added; i++) {
+      heights.push(heights[plan.digits[i]] ?? last);
+      tsbs.push(tsbs[plan.digits[i]] ?? 0);
+    }
+    const w = new Writer(heights.length * 4);
+    heights.forEach((h, i) => {
+      w.u16(h);
+      w.i16(tsbs[i]);
+    });
+    tables.set("vmtx", w.toBytes());
+    const vheaCopy = vhea.slice();
+    new DataView(vheaCopy.buffer).setUint16(34, heights.length);
+    tables.set("vhea", vheaCopy);
+  }
 }
 
 function patchOs2(
