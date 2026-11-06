@@ -30,7 +30,7 @@ export function Preview() {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex h-11 shrink-0 items-center gap-2 border-b border-white/6 px-4">
-        <div className="w-[228px]">
+        <div className="w-[304px]">
           <Toggle
             value={preview.mode}
             onChange={(v) => setPreview({ mode: v as typeof preview.mode })}
@@ -38,6 +38,7 @@ export function Preview() {
               { value: "text", label: "Text" },
               { value: "waterfall", label: "Waterfall" },
               { value: "glyphs", label: "Glyphs" },
+              { value: "numbers", label: "Numbers" },
             ]}
           />
         </div>
@@ -77,6 +78,7 @@ export function Preview() {
           {preview.mode === "text" && <EditableText style={style} size={preview.size} />}
           {preview.mode === "waterfall" && <Waterfall style={style} />}
           {preview.mode === "glyphs" && <Glyphs style={style} />}
+          {preview.mode === "numbers" && <Numbers style={style} size={preview.size} />}
         </div>
       </div>
 
@@ -132,6 +134,60 @@ function Glyphs({ style }: { style: React.CSSProperties }) {
           <span style={{ ...style, fontSize: 30, letterSpacing: 0, textAlign: "center" }}>{ch}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+const LEDGER: [string, string][] = [
+  ["Revenue", "1,111.11"],
+  ["Costs", "808.47"],
+  ["Margin", "9,302.64"],
+  ["Growth", "17.10%"],
+  ["Accounts", "41,071"],
+  ["Total", "52,310.32"],
+];
+
+/**
+ * The same column set twice: once with proportional figures, once with
+ * tabular ones. Right-aligned, so only tabular figures stack digit over digit.
+ */
+function Numbers({ style, size }: { style: React.CSSProperties; size: number }) {
+  const info = useApp((s) => s.figureInfo);
+  const enabled = useApp((s) => s.figures.enabled);
+  const fontSize = Math.round(Math.max(14, Math.min(size * 0.42, 52)));
+  const has = (tag: string) => Boolean(info?.features.includes(tag) || (enabled && info?.generates));
+
+  const column = (variant: "proportional-nums" | "tabular-nums", title: string, tag: string) => (
+    <div className="min-w-0 flex-1">
+      <div className="mb-3 flex items-baseline gap-2 text-[11px] text-[var(--faint)]">
+        <span className="font-semibold uppercase tracking-[0.14em]">{title}</span>
+        <span className="font-mono">{tag}</span>
+        {!has(tag) && <span className="text-[var(--warn)]">not in this font</span>}
+      </div>
+      <div className="rounded-xl border border-white/8">
+        {LEDGER.map(([label, value], i) => (
+          <div
+            key={label}
+            className={cx("flex items-baseline justify-between gap-6 px-4 py-1.5", i > 0 && "border-t border-white/6")}
+          >
+            <span className="text-[12px] text-[var(--faint)]">{label}</span>
+            <span style={{ ...style, fontSize, letterSpacing: 0, textAlign: "right", fontVariantNumeric: variant }}>{value}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div className="flex flex-wrap gap-6">
+        {column("proportional-nums", "Proportional", "pnum")}
+        {column("tabular-nums", "Tabular", "tnum")}
+      </div>
+      <p className="max-w-[560px] text-[11.5px] leading-relaxed text-[var(--faint)]">
+        Both columns are right-aligned. With tabular figures every digit has the same width, so units sit under units
+        and decimals under decimals at every weight on the axes.
+      </p>
     </div>
   );
 }

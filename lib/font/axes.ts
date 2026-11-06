@@ -13,7 +13,25 @@ export interface AxisStop {
   id: string;
   /** User-space coordinate, between the axis min and max. */
   at: number;
+  /**
+   * Applied on top of what the axis already has here: the uploaded drawing
+   * for a drawn master, otherwise whatever the drawn masters interpolate to.
+   */
   deformation: Deformation;
+  /** Set when this master is an uploaded face rather than a synthesis. */
+  faceId?: string;
+}
+
+/**
+ * A drawn master that sits off the axes — a Bold Italic at (wght 700, ital 1).
+ * Its region spans both axes, and its delta is only what the weight and
+ * italic masters together fail to predict.
+ */
+export interface CornerMaster {
+  id: string;
+  faceId: string;
+  /** Axis tag → user-space coordinate. */
+  coords: Record<string, number>;
 }
 
 export interface AxisDef {
@@ -61,8 +79,8 @@ export function newId(prefix: string) {
   return `${prefix}-${counter}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-export function makeStop(at: number, d: Partial<Deformation> = {}): AxisStop {
-  return { id: newId("stop"), at, deformation: deformation(d) };
+export function makeStop(at: number, d: Partial<Deformation> = {}, faceId?: string): AxisStop {
+  return { id: newId("stop"), at, deformation: deformation(d), ...(faceId ? { faceId } : {}) };
 }
 
 /**
@@ -163,6 +181,62 @@ export function makeAxis(tag: string, shape: FontShape): AxisDef {
     max,
     stops: [min, max].filter((v) => v !== def).map((v) => makeStop(v)),
   };
+}
+
+/** A drawn face as the axis presets see it. */
+export interface DrawnStyle {
+  id: string;
+  weight: number;
+  italic: boolean;
+  italicAngle: number;
+  shape: FontShape;
+}
+
+/**
+ * Weight and italic axes for a family with uploaded masters.
+ *
+ * Every uploaded weight becomes a drawn stop. Synthetic stops are only added
+ * outside the drawn range, each measured from the nearest drawn extreme — so
+ * between two real weights the axis interpolates real drawings. Italics
+ * become the `ital` axis; italics at other weights become corner masters.
+ */
+export function makeFamilyAxes(shape: FontShape, faces: DrawnStyle[]): { axes: AxisDef[]; corners: CornerMaster[] } {
+  const uprights = faces.filter((f) => !f.italic);
+  const italics = faces.filter((f) => f.italic);
+  const def = Math.min(1000, Math.max(1, shape.weight));
+
+  const all = [def, ...faces.map((f) => f.weight)];
+  const min = Math.min(100, ...all);
+  const max = Math.max(900, ...all);
+
+  const ladder = [{ weight: def, shape }, ...uprights.map((f) => ({ weight: f.weight, shape: f.shape }))].sort(
+    (a, b) => a.weight - b.weight,
+  );
+  const lightest = ladder[0];
+  const heaviest = ladder[ladder.length - 1];
+
+  const stops: AxisStop[] = uprights.map((f) => makeStop(f.weight, {}, f.id));
+  for (let value = 100; value <= 900; value += 100) {
+    if (value < lightest.weight) stops.push(makeStop(value, { weight: weightOffset(value, lightest.shape) }));
+    if (value > heaviest.weight) stops.push(makeStop(value, { weight: weightOffset(value, heaviest.shape) }));
+  }
+  stops.sort((a, b) => a.at - b.at);
+
+  const wght: AxisDef = { id: newId("axis"), tag: "wght", name: "Weight", min, def, max, hidden: false, stops };
+  if (italics.length === 0) return { axes: [wght, makeAxis("ital", shape)], corners: [] };
+
+  const atDefault = italics.find((f) => f.weight === def);
+  const angle = italics.reduce((sum, f) => sum + f.italicAngle, 0) / italics.length;
+  const italStop = atDefault
+    ? makeStop(1, {}, atDefault.id)
+    : makeStop(1, { slant: -angle || 11, widthScale: 0.97, weight: -shape.stem * 0.04 });
+  const ital: AxisDef = { id: newId("axis"), tag: "ital", name: "Italic", min: 0, def: 0, max: 1, hidden: false, stops: [italStop] };
+
+  const corners: CornerMaster[] = italics
+    .filter((f) => f !== atDefault)
+    .map((f) => ({ id: newId("corner"), faceId: f.id, coords: { wght: f.weight, ital: 1 } }));
+
+  return { axes: [wght, ital], corners };
 }
 
 /**

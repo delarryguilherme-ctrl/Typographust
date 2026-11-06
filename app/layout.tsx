@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Axis — variable font editor",
   description:
-    "Upload a static TTF, synthesise weights, italics and custom axes, preview live, and export a variable font.",
+    "Upload a font or a whole family — TTF, OTF, WOFF, WOFF2, TTC — combine drawn and synthesised masters, add tabular figures, and export a variable font.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

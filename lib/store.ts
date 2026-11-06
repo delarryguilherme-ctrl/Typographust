@@ -1,23 +1,31 @@
 "use client";
 
 import { create } from "zustand";
-import { buildStaticFonts, buildVariableFont, loadSource, type SourceFont } from "./font/build";
+import { buildStaticFonts, buildVariableFont, loadFaces, type SourceFont } from "./font/build";
 import { buildZip } from "./font/zip";
 import {
   defaultInstances,
   deformationAt,
   makeAxis,
+  makeFamilyAxes,
   makeStop,
   newId,
   normalize,
   validateAxes,
   type AxisDef,
   type AxisStop,
+  type CornerMaster,
   type NamedInstance,
 } from "./font/axes";
+import type { SourceFace } from "./font/face";
+import { assembleFamily } from "./font/family";
+import { analyzeFigures, DEFAULT_FIGURES, type FigureInfo, type FigureOptions } from "./font/figures";
 import type { Deformation } from "./font/transform";
 
-export type PreviewMode = "text" | "waterfall" | "glyphs";
+export type PreviewMode = "text" | "waterfall" | "glyphs" | "numbers";
+
+/** Formats the file picker offers. Detection is by content, not extension. */
+export const FONT_ACCEPT = ".ttf,.otf,.woff,.woff2,.ttc,.otc,font/ttf,font/otf,font/woff,font/woff2,font/collection";
 
 export interface BuiltFont {
   url: string;
@@ -28,9 +36,19 @@ export interface BuiltFont {
 }
 
 interface AppState {
+  /** Every font read from the uploaded files; a collection contributes several. */
+  faces: SourceFace[];
+  defaultFaceId: string | null;
+  excludedFaceIds: string[];
+  /** The family as assembled from `faces`: the default plus its drawn masters. */
   source: SourceFont | null;
   loadError: string | null;
   loading: boolean;
+
+  /** Drawn masters that sit off the axes, such as a Bold Italic. */
+  corners: CornerMaster[];
+  figures: FigureOptions;
+  figureInfo: FigureInfo | null;
 
   familyName: string;
   axes: AxisDef[];
@@ -54,8 +72,13 @@ interface AppState {
   buildError: string | null;
   issues: string[];
 
-  loadFile: (file: File) => Promise<void>;
+  /** Reads the files and adds them to the family (or starts one). */
+  loadFiles: (files: File[]) => Promise<void>;
   reset: () => void;
+  setDefaultFace: (id: string) => void;
+  toggleFace: (id: string) => void;
+  removeFace: (id: string) => void;
+  setFigures: (patch: Partial<FigureOptions>) => void;
 
   setFamilyName: (name: string) => void;
   addAxis: (tag: string) => void;
@@ -100,10 +123,61 @@ function clampCoords(axes: AxisDef[], coords: Record<string, number>) {
   return next;
 }
 
+/**
+ * Re-assembles the family after the set of faces or their roles changed. The
+ * weight and italic axes follow the drawn masters; every other axis the user
+ * set up is kept.
+ */
+function assemble(
+  faces: SourceFace[],
+  defaultFaceId: string | null,
+  excluded: string[],
+  previous: { axes: AxisDef[]; familyName: string; source: SourceFont | null },
+) {
+  const source = assembleFamily(faces, { defaultId: defaultFaceId, excluded: new Set(excluded) });
+
+  let familyAxes: AxisDef[];
+  let corners: CornerMaster[] = [];
+  if (source.drawn.length > 0) {
+    ({ axes: familyAxes, corners } = makeFamilyAxes(source.shape, source.drawn));
+  } else {
+    // Seed with the axes that make sense for a single-master source: weight
+    // first, then `ital` rather than `slnt` — design tools and CSS treat
+    // `ital` as the italic switch, while `slnt` is just another slider.
+    familyAxes = [makeAxis("wght", source.shape), makeAxis("ital", source.shape)];
+  }
+  const kept = previous.axes.filter((a) => a.tag !== "wght" && a.tag !== "ital" && !a.stops.some((s) => s.faceId));
+  const axes = [...familyAxes, ...kept];
+
+  // Suffixed so the export never collides with the static already installed
+  // under the same name. A name the user typed survives re-assembly.
+  const sameFamily = previous.source?.familyName === source.familyName;
+  const familyName = sameFamily && previous.familyName ? previous.familyName : `${source.familyName} VF`;
+
+  return {
+    source,
+    defaultFaceId: faces.find((f) => source.roles.some((r) => r.id === f.id && r.role === "default"))?.id ?? null,
+    axes,
+    corners,
+    instances: defaultInstances(axes),
+    familyName,
+    figureInfo: analyzeFigures(source),
+    selectedAxisId: axes[0]?.id ?? null,
+    coords: clampCoords(axes, {}),
+    issues: validateAxes(axes),
+  };
+}
+
 export const useApp = create<AppState>((set, get) => ({
+  faces: [],
+  defaultFaceId: null,
+  excludedFaceIds: [],
   source: null,
   loadError: null,
   loading: false,
+  corners: [],
+  figures: DEFAULT_FIGURES,
+  figureInfo: null,
 
   familyName: "",
   axes: [],
@@ -126,31 +200,36 @@ export const useApp = create<AppState>((set, get) => ({
   issues: [],
   exportingStatics: false,
 
-  async loadFile(file) {
+  async loadFiles(files) {
+    if (files.length === 0) return;
     set({ loading: true, loadError: null });
+
+    const added: SourceFace[] = [];
+    const failed: string[] = [];
+    for (const file of files) {
+      try {
+        added.push(...(await loadFaces(new Uint8Array(await file.arrayBuffer()), file.name)));
+      } catch (e) {
+        failed.push(`${file.name}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    const loadError = failed.length ? failed.join("\n") : null;
+    if (added.length === 0) {
+      set({ loading: false, loadError });
+      return;
+    }
+
     try {
-      const buffer = new Uint8Array(await file.arrayBuffer());
-      const source = loadSource(buffer, file.name);
-
-      // Seed with the axes that make sense for a single-master source: weight
-      // first, then `ital` rather than `slnt` — design tools and CSS treat
-      // `ital` as the italic switch, while `slnt` is just another slider.
-      const axes = [makeAxis("wght", source.shape), makeAxis("ital", source.shape)];
-      const instances = defaultInstances(axes);
-
+      const { faces, defaultFaceId, excludedFaceIds, axes, familyName, source } = get();
+      const nextFaces = [...faces, ...added];
       set({
-        source,
+        ...assemble(nextFaces, defaultFaceId, excludedFaceIds, { axes, familyName, source }),
+        faces: nextFaces,
         loading: false,
-        // Suffixed so the export never collides with the static already
-        // installed under the same name.
-        familyName: `${source.familyName} VF`,
-        axes,
-        instances,
-        selectedAxisId: axes[0].id,
-        coords: clampCoords(axes, {}),
-        built: null,
+        loadError,
+        built: get().built,
         buildError: null,
-        issues: validateAxes(axes),
       });
       get().rebuild();
     } catch (e) {
@@ -161,7 +240,12 @@ export const useApp = create<AppState>((set, get) => ({
   reset() {
     if (get().built) URL.revokeObjectURL(get().built!.url);
     set({
+      faces: [],
+      defaultFaceId: null,
+      excludedFaceIds: [],
       source: null,
+      corners: [],
+      figureInfo: null,
       loadError: null,
       familyName: "",
       axes: [],
@@ -172,6 +256,39 @@ export const useApp = create<AppState>((set, get) => ({
       buildError: null,
       issues: [],
     });
+  },
+
+  setDefaultFace(id) {
+    const { faces, excludedFaceIds, axes, familyName, source } = get();
+    const excluded = excludedFaceIds.filter((x) => x !== id);
+    set({ ...assemble(faces, id, excluded, { axes, familyName, source }), excludedFaceIds: excluded });
+    get().rebuild();
+  },
+
+  toggleFace(id) {
+    const { faces, defaultFaceId, excludedFaceIds, axes, familyName, source } = get();
+    if (id === defaultFaceId) return;
+    const excluded = excludedFaceIds.includes(id) ? excludedFaceIds.filter((x) => x !== id) : [...excludedFaceIds, id];
+    set({ ...assemble(faces, defaultFaceId, excluded, { axes, familyName, source }), excludedFaceIds: excluded });
+    get().rebuild();
+  },
+
+  removeFace(id) {
+    const { faces, defaultFaceId, excludedFaceIds, axes, familyName, source } = get();
+    const next = faces.filter((f) => f.id !== id);
+    if (next.length === 0) {
+      get().reset();
+      return;
+    }
+    const excluded = excludedFaceIds.filter((x) => x !== id);
+    const nextDefault = defaultFaceId === id ? null : defaultFaceId;
+    set({ ...assemble(next, nextDefault, excluded, { axes, familyName, source }), faces: next, excludedFaceIds: excluded });
+    get().rebuild();
+  },
+
+  setFigures(patch) {
+    set({ figures: { ...get().figures, ...patch } });
+    get().rebuild();
   },
 
   setFamilyName(name) {
@@ -308,7 +425,7 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   exportStatics() {
-    const { source, axes, instances, familyName, issues } = get();
+    const { source, axes, instances, familyName, issues, corners, figures } = get();
     if (!source || issues.length > 0 || instances.length === 0) return;
 
     set({ exportingStatics: true, buildError: null });
@@ -316,7 +433,7 @@ export const useApp = create<AppState>((set, get) => ({
     // thread is tied up flattening every instance.
     setTimeout(() => {
       try {
-        const statics = buildStaticFonts(source, { familyName, axes, instances });
+        const statics = buildStaticFonts(source, { familyName, axes, instances, corners, figures });
         const zip = buildZip(statics.map((s) => ({ name: s.fileName, data: s.data })));
         const url = URL.createObjectURL(new Blob([zip.slice().buffer as ArrayBuffer], { type: "application/zip" }));
 
@@ -340,7 +457,7 @@ export const useApp = create<AppState>((set, get) => ({
     set({ building: true, buildError: null });
 
     buildTimer = setTimeout(() => {
-      const { axes, instances, familyName, built } = get();
+      const { axes, instances, familyName, built, corners, figures } = get();
       const issues = validateAxes(axes);
       set({ issues });
       if (issues.length > 0) {
@@ -349,7 +466,7 @@ export const useApp = create<AppState>((set, get) => ({
       }
 
       try {
-        const result = buildVariableFont(source, { familyName, axes, instances });
+        const result = buildVariableFont(source, { familyName, axes, instances, corners, figures });
         const blob = new Blob([result.data.slice().buffer as ArrayBuffer], { type: "font/ttf" });
         const url = URL.createObjectURL(blob);
 

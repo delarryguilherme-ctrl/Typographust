@@ -107,10 +107,8 @@ function embolden(points: Point[], endPts: number[], amount: number): Point[] {
       let nx = inN.x + outN.x;
       let ny = inN.y + outN.y;
       const len = Math.hypot(nx, ny);
-      if (len < 1e-9) {
-        start = end + 1;
-        continue;
-      }
+      // A cusp or a doubled point has no usable normal; leave it where it is.
+      if (len < 1e-9) continue;
       nx /= len;
       ny /= len;
 

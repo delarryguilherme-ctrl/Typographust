@@ -2,11 +2,11 @@
 
 import { useCallback, useRef, useState } from "react";
 import { motion } from "motion/react";
-import { useApp } from "@/lib/store";
+import { FONT_ACCEPT, useApp } from "@/lib/store";
 import { Note, cx } from "./ui";
 
 export function Dropzone() {
-  const loadFile = useApp((s) => s.loadFile);
+  const loadFiles = useApp((s) => s.loadFiles);
   const loading = useApp((s) => s.loading);
   const error = useApp((s) => s.loadError);
   const [over, setOver] = useState(false);
@@ -14,10 +14,9 @@ export function Dropzone() {
 
   const accept = useCallback(
     (files: FileList | null) => {
-      const file = files?.[0];
-      if (file) void loadFile(file);
+      if (files && files.length > 0) void loadFiles([...files]);
     },
-    [loadFile],
+    [loadFiles],
   );
 
   return (
@@ -31,8 +30,8 @@ export function Dropzone() {
         <div className="mb-9 text-center">
           <h1 className="text-[30px] font-semibold leading-tight tracking-[-0.02em]">Make it variable</h1>
           <p className="mx-auto mt-2.5 max-w-[400px] text-[13px] leading-relaxed text-[var(--muted)]">
-            Drop a static TrueType font. Synthesise weights, slants, optical sizes and custom axes, then export a
-            single variable <span className="font-mono text-[12px]">.ttf</span>.
+            Drop one font, or a whole family. Extra weights and italics become real masters; whatever is missing is
+            synthesised. Export a single variable <span className="font-mono text-[12px]">.ttf</span>.
           </p>
         </div>
 
@@ -56,27 +55,33 @@ export function Dropzone() {
           <input
             ref={input}
             type="file"
-            accept=".ttf,font/ttf,application/x-font-ttf"
+            accept={FONT_ACCEPT}
+            multiple
             className="hidden"
-            onChange={(e) => accept(e.target.files)}
+            onChange={(e) => {
+              accept(e.target.files);
+              e.target.value = "";
+            }}
           />
 
           <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-white/[0.04] text-[17px] font-medium transition-transform duration-200 group-hover:-translate-y-0.5">
             {loading ? <Spinner /> : "A"}
           </div>
-          <p className="text-[13.5px] font-medium">{loading ? "Reading outlines…" : "Drop a .ttf, or click to browse"}</p>
-          <p className="mt-1.5 text-[11.5px] text-[var(--faint)]">TrueType outlines only — .otf and .ttc are not supported</p>
+          <p className="text-[13.5px] font-medium">{loading ? "Reading outlines…" : "Drop fonts, or click to browse"}</p>
+          <p className="mt-1.5 text-[11.5px] text-[var(--faint)]">.ttf · .otf · .woff · .woff2 · .ttc · .otc — several at once for a family</p>
         </div>
 
         {error && (
           <div className="mt-4">
-            <Note tone="danger">{error}</Note>
+            <Note tone="danger">
+              <span className="whitespace-pre-line">{error}</span>
+            </Note>
           </div>
         )}
 
         <p className="mt-8 text-center text-[11px] leading-relaxed text-[var(--faint)]">
-          One master can&apos;t describe a real weight range. Extra masters are synthesised by transforming the
-          outlines you upload — useful, but not a replacement for drawn weights.
+          One master can&apos;t describe a real weight range. Upload the weights you have — Regular and Bold, say — and
+          they interpolate as drawn; only the range beyond them is synthesised.
         </p>
       </motion.div>
     </div>
